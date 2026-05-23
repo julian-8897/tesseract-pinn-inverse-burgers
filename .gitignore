@@ -55,3 +55,10 @@ tesseract_cache/
 
 # Logs
 *.log
+
+# Local planning / agent notes
+AGENTS.md
+CLAUDE.md
+PLAN.md
+TIER0_PLAN.md
+todo.md
