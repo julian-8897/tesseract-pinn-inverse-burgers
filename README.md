@@ -117,6 +117,7 @@ The inverse loop optimizes `log_nu` and evaluates the PDE residual with `nu = ex
 
 ```
 tesseract-pinn-inverse-burgers/
+├── configs.py                 # Dataclass run/problem/data/training configs
 ├── inverse_problem.py         # CLI demo comparing JAX/PyTorch backends
 ├── app.py                     # Streamlit interactive interface
 ├── buildall.sh                # Builds Docker containers for all Tesseracts

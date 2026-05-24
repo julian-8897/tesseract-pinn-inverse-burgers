@@ -11,8 +11,7 @@ in Burgers equation: ∂u/∂t + u·∂u/∂x = ν·∂²u/∂x²
 
 import sys
 import time
-from collections.abc import Mapping
-from math import isfinite
+from dataclasses import replace
 from pathlib import Path
 from statistics import fmean, pstdev
 
@@ -32,44 +31,18 @@ from rich.table import Table
 from tesseract_core import Tesseract
 from tesseract_jax import apply_tesseract
 
+from configs import (
+    DEFAULT_LOSS_WEIGHTS,
+    LOSS_WEIGHT_NAMES,
+    LossWeights,
+    RunConfig,
+    loss_weights_from_mapping,
+    normalize_loss_weights,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parent
 CONSOLE = Console()
-DEFAULT_LOSS_WEIGHTS = {
-    "data": 1.0,
-    "physics": 0.1,
-    "ic": 0.5,
-    "bc": 0.5,
-}
-LOSS_WEIGHT_NAMES = tuple(DEFAULT_LOSS_WEIGHTS)
-
-
-def normalize_loss_weights(loss_weights=None):
-    """Return validated non-negative loss weights with defaults filled in."""
-    if loss_weights is None:
-        loss_weights = {}
-    if not isinstance(loss_weights, Mapping):
-        raise TypeError(
-            "loss_weights must be a mapping of loss component names to weights"
-        )
-
-    unknown = set(loss_weights) - set(LOSS_WEIGHT_NAMES)
-    if unknown:
-        names = ", ".join(sorted(unknown))
-        raise ValueError(f"Unknown loss weight(s): {names}")
-
-    normalized = DEFAULT_LOSS_WEIGHTS.copy()
-    normalized.update(loss_weights)
-
-    for name, value in normalized.items():
-        value = float(value)
-        if not isfinite(value):
-            raise ValueError(f"Loss weight '{name}' must be finite")
-        if value < 0:
-            raise ValueError(f"Loss weight '{name}' must be non-negative")
-        normalized[name] = value
-
-    return normalized
 
 
 def format_loss_weights(loss_weights):
@@ -77,16 +50,82 @@ def format_loss_weights(loss_weights):
     return ", ".join(f"{name}={loss_weights[name]:g}" for name in LOSS_WEIGHT_NAMES)
 
 
-def log_run_header(backend, true_viscosity, initial_viscosity, loss_weights, seed):
+def build_run_config(
+    config=None,
+    *,
+    backend=None,
+    true_viscosity=None,
+    initial_viscosity=None,
+    n_obs=None,
+    n_epochs=None,
+    learning_rate=None,
+    param_learning_rate=None,
+    loss_weights=None,
+    seed=None,
+    noise_std=None,
+    n_col=None,
+    n_ic=None,
+    n_bc=None,
+):
+    """Build a RunConfig from defaults plus legacy keyword overrides."""
+    config = RunConfig() if config is None else config
+
+    if backend is not None:
+        config = replace(config, backend=backend)
+
+    problem_updates = {}
+    if true_viscosity is not None:
+        problem_updates["true_viscosity"] = true_viscosity
+    if initial_viscosity is not None:
+        problem_updates["initial_viscosity"] = initial_viscosity
+    if problem_updates:
+        config = replace(config, problem=replace(config.problem, **problem_updates))
+
+    data_updates = {}
+    if n_obs is not None:
+        data_updates["n_obs"] = n_obs
+    if seed is not None:
+        data_updates["seed"] = seed
+    if noise_std is not None:
+        data_updates["noise_std"] = noise_std
+    if data_updates:
+        config = replace(config, data=replace(config.data, **data_updates))
+
+    training_updates = {}
+    if n_epochs is not None:
+        training_updates["n_epochs"] = n_epochs
+    if learning_rate is not None:
+        training_updates["log_nu_learning_rate"] = learning_rate
+    if param_learning_rate is not None:
+        training_updates["param_learning_rate"] = param_learning_rate
+    if n_col is not None:
+        training_updates["n_col"] = n_col
+    if n_ic is not None:
+        training_updates["n_ic"] = n_ic
+    if n_bc is not None:
+        training_updates["n_bc"] = n_bc
+    if training_updates:
+        config = replace(config, training=replace(config.training, **training_updates))
+
+    if loss_weights is not None:
+        config = replace(config, loss=loss_weights_from_mapping(loss_weights))
+    elif not isinstance(config.loss, LossWeights):
+        config = replace(config, loss=loss_weights_from_mapping(config.loss))
+
+    return config
+
+
+def log_run_header(config):
     """Log the inverse-problem run configuration."""
-    CONSOLE.rule(f"[bold cyan]Inverse Problem: {backend.upper()} PINN")
+    loss_weights = config.loss.as_dict()
+    CONSOLE.rule(f"[bold cyan]Inverse Problem: {config.backend.upper()} PINN")
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("Parameter", style="bold")
     table.add_column("Value", style="cyan")
-    table.add_row("True viscosity", f"ν = {true_viscosity:.6f}")
-    table.add_row("Initial guess", f"ν = {initial_viscosity:.6f}")
+    table.add_row("True viscosity", f"ν = {config.problem.true_viscosity:.6f}")
+    table.add_row("Initial guess", f"ν = {config.problem.initial_viscosity:.6f}")
     table.add_row("Loss weights", format_loss_weights(loss_weights))
-    table.add_row("Seed", str(seed))
+    table.add_row("Seed", str(config.data.seed))
     CONSOLE.print(table)
 
 
@@ -248,7 +287,7 @@ def get_initial_params(backend="jax", seed=42):
         return jnp.array(params)
 
 
-def generate_observations(n_points, true_viscosity, domain, key):
+def generate_observations(n_points, true_viscosity, domain, key, noise_std=0.02):
     """
     Generate synthetic observations from the pseudospectral Burgers solver.
 
@@ -282,7 +321,7 @@ def generate_observations(n_points, true_viscosity, domain, key):
     u_observed = u_field[t_idx, x_idx]
 
     # Add small noise
-    noise = jax.random.normal(keys[2], (n_points,)) * 0.02
+    noise = jax.random.normal(keys[2], (n_points,)) * noise_std
     u_observed = u_observed + noise
 
     return x, t, u_observed
@@ -454,14 +493,15 @@ def compute_loss_from_log_viscosity(
 
 
 def run_inverse_problem(
-    backend="jax",
-    true_viscosity=0.05,
-    initial_viscosity=0.01,
-    n_obs=100,
-    n_epochs=200,
-    learning_rate=0.1,
+    config=None,
+    backend=None,
+    true_viscosity=None,
+    initial_viscosity=None,
+    n_obs=None,
+    n_epochs=None,
+    learning_rate=None,
     loss_weights=None,
-    seed=123,
+    seed=None,
 ):
     """
     Run inverse problem to infer viscosity parameter.
@@ -469,48 +509,67 @@ def run_inverse_problem(
     Args:
         backend: "jax" or "pytorch" - which PINN tesseract to use
     """
-    domain = {"x": (0.0, 1.0), "t": (0.0, 1.0)}
-    loss_weights = normalize_loss_weights(loss_weights)
-    if initial_viscosity <= 0:
+    config = build_run_config(
+        config,
+        backend=backend,
+        true_viscosity=true_viscosity,
+        initial_viscosity=initial_viscosity,
+        n_obs=n_obs,
+        n_epochs=n_epochs,
+        learning_rate=learning_rate,
+        loss_weights=loss_weights,
+        seed=seed,
+    )
+    backend = config.backend
+    problem = config.problem
+    data_config = config.data
+    training = config.training
+    loss_weights = config.loss.as_dict()
+    domain = problem.domain
+
+    if problem.initial_viscosity <= 0:
         raise ValueError("initial_viscosity must be positive when optimizing log_nu")
 
-    log_run_header(backend, true_viscosity, initial_viscosity, loss_weights, seed)
+    log_run_header(config)
 
     # Make observations and collocation points
-    key = jax.random.PRNGKey(seed)
+    key = jax.random.PRNGKey(data_config.seed)
     key_obs, key_col_x, key_col_t, key_ic, key_bc = jax.random.split(key, 5)
     x_obs, t_obs, u_obs = generate_observations(
-        n_obs, true_viscosity, domain, key_obs
+        data_config.n_obs,
+        problem.true_viscosity,
+        domain,
+        key_obs,
+        noise_std=data_config.noise_std,
     )
-    n_col = 200
     x_col = jax.random.uniform(
-        key_col_x, (n_col,), minval=domain["x"][0], maxval=domain["x"][1]
+        key_col_x, (training.n_col,), minval=domain["x"][0], maxval=domain["x"][1]
     )
     t_col = jax.random.uniform(
-        key_col_t, (n_col,), minval=0.05, maxval=domain["t"][1]
+        key_col_t, (training.n_col,), minval=0.05, maxval=domain["t"][1]
     )
 
-    n_ic = 50
     x_ic = jax.random.uniform(
-        key_ic, (n_ic,), minval=domain["x"][0], maxval=domain["x"][1]
+        key_ic, (training.n_ic,), minval=domain["x"][0], maxval=domain["x"][1]
     )
 
-    n_bc = 50
-    t_bc = jax.random.uniform(key_bc, (n_bc,), minval=0.05, maxval=domain["t"][1])
+    t_bc = jax.random.uniform(
+        key_bc, (training.n_bc,), minval=0.05, maxval=domain["t"][1]
+    )
 
     image_name = "pinn_jax" if backend == "jax" else "pinn_pytorch"
     pinn = Tesseract.from_image(image_name)
 
-    params_flat = get_initial_params(backend, seed=seed)
+    params_flat = get_initial_params(backend, seed=data_config.seed)
     CONSOLE.log(f"Model parameters: {params_flat.size}")
 
-    log_viscosity = jnp.log(jnp.asarray(initial_viscosity))
+    log_viscosity = jnp.log(jnp.asarray(problem.initial_viscosity))
     viscosity = jnp.exp(log_viscosity)
 
-    log_visc_optimizer = optax.adam(learning_rate)
+    log_visc_optimizer = optax.adam(training.log_nu_learning_rate)
     log_visc_opt_state = log_visc_optimizer.init(log_viscosity)
 
-    param_optimizer = optax.adam(1e-3)
+    param_optimizer = optax.adam(training.param_learning_rate)
     param_opt_state = param_optimizer.init(params_flat)
 
     # Gradient functions
@@ -530,14 +589,14 @@ def run_inverse_problem(
         with make_training_progress() as progress:
             task_id = progress.add_task(
                 f"{backend.upper()} training",
-                total=n_epochs,
+                total=training.n_epochs,
                 loss="pending",
                 nu=f"{float(viscosity):.6f}",
-                error=f"{abs(float(viscosity) - true_viscosity):.6f}",
+                error=f"{abs(float(viscosity) - problem.true_viscosity):.6f}",
                 epoch_time="pending",
             )
 
-            for epoch in range(n_epochs):
+            for epoch in range(training.n_epochs):
                 start_time = time.time()
 
                 # Compute gradients
@@ -587,7 +646,7 @@ def run_inverse_problem(
                 log_viscosity_history.append(float(log_viscosity))
 
                 loss_value = loss_history["total"][-1] if loss_history["total"] else None
-                if epoch % 20 == 0 or epoch == n_epochs - 1:
+                if epoch % 20 == 0 or epoch == training.n_epochs - 1:
                     loss_components = compute_loss_components(
                         viscosity,
                         params_flat,
@@ -610,17 +669,21 @@ def run_inverse_problem(
                     advance=1,
                     loss=f"{loss_value:.3e}" if loss_value is not None else "pending",
                     nu=f"{float(viscosity):.6f}",
-                    error=f"{abs(float(viscosity) - true_viscosity):.6f}",
+                    error=f"{abs(float(viscosity) - problem.true_viscosity):.6f}",
                     epoch_time=f"{epoch_time * 1000:.0f}ms",
                 )
 
         final_viscosity = float(viscosity)
-        relative_error = abs(final_viscosity - true_viscosity) / true_viscosity * 100
+        relative_error = (
+            abs(final_viscosity - problem.true_viscosity)
+            / problem.true_viscosity
+            * 100
+        )
         avg_time = sum(times) / len(times) * 1000 if times else 0.0
 
         log_final_results(
             final_viscosity,
-            true_viscosity,
+            problem.true_viscosity,
             relative_error,
             avg_time,
             loss_history,
@@ -629,20 +692,33 @@ def run_inverse_problem(
     return {
         "backend": backend,
         "final_viscosity": final_viscosity,
-        "true_viscosity": true_viscosity,
+        "true_viscosity": problem.true_viscosity,
         "relative_error": relative_error,
         "avg_time_ms": avg_time,
         "viscosity_history": viscosity_history,
         "log_viscosity_history": log_viscosity_history,
         "loss_history": loss_history,
         "loss_weights": loss_weights,
-        "seed": seed,
+        "seed": data_config.seed,
+        "config": config,
     }
 
 
-def compare_backends(n_epochs=50, n_obs=80, loss_weights=None, seed=123):
+def compare_backends(
+    config=None,
+    n_epochs=None,
+    n_obs=None,
+    loss_weights=None,
+    seed=None,
+):
     """Run inverse problem with both backends for comparison."""
-    loss_weights = normalize_loss_weights(loss_weights)
+    config = build_run_config(
+        config,
+        n_epochs=n_epochs,
+        n_obs=n_obs,
+        loss_weights=loss_weights,
+        seed=seed,
+    )
 
     CONSOLE.rule("[bold cyan]Cross-Framework Autodiff Comparison")
 
@@ -650,24 +726,12 @@ def compare_backends(n_epochs=50, n_obs=80, loss_weights=None, seed=123):
 
     # Run JAX PINN
     results["jax"] = run_inverse_problem(
-        backend="jax",
-        true_viscosity=0.05,
-        initial_viscosity=0.01,
-        n_obs=n_obs,
-        n_epochs=n_epochs,
-        loss_weights=loss_weights,
-        seed=seed,
+        config=config.with_backend("jax"),
     )
 
     # Run PyTorch PINN
     results["pytorch"] = run_inverse_problem(
-        backend="pytorch",
-        true_viscosity=0.05,
-        initial_viscosity=0.01,
-        n_obs=n_obs,
-        n_epochs=n_epochs,
-        loss_weights=loss_weights,
-        seed=seed,
+        config=config.with_backend("pytorch"),
     )
 
     log_backend_comparison(results)
@@ -690,38 +754,48 @@ def compare_backends(n_epochs=50, n_obs=80, loss_weights=None, seed=123):
     return results
 
 
-def run_single_backend(backend="jax", n_epochs=50, loss_weights=None, seed=123):
+def run_single_backend(
+    backend=None,
+    n_epochs=None,
+    loss_weights=None,
+    seed=None,
+    config=None,
+):
     """Run inverse problem with a single backend only."""
+    if config is None and backend is None:
+        backend = "jax"
     return run_inverse_problem(
+        config=config,
         backend=backend,
-        true_viscosity=0.05,
-        initial_viscosity=0.01,
-        n_obs=80,
         n_epochs=n_epochs,
         loss_weights=loss_weights,
         seed=seed,
     )
 
 
-def run_seed_sweep(backend="jax", seeds=(123,), n_epochs=50, loss_weights=None):
+def run_seed_sweep(
+    backend="jax",
+    seeds=(123,),
+    n_epochs=None,
+    loss_weights=None,
+    config=None,
+):
     """Run one backend or both backends across multiple random seeds."""
+    config = build_run_config(config, n_epochs=n_epochs, loss_weights=loss_weights)
     results = []
 
     for seed in seeds:
+        seed_config = config.with_seed(seed)
         if backend == "both":
             backend_results = compare_backends(
-                n_epochs=n_epochs,
-                loss_weights=loss_weights,
-                seed=seed,
+                config=seed_config,
             )
             results.extend(backend_results.values())
         else:
             results.append(
                 run_single_backend(
                     backend=backend,
-                    n_epochs=n_epochs,
-                    loss_weights=loss_weights,
-                    seed=seed,
+                    config=seed_config,
                 )
             )
 
@@ -779,7 +853,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        loss_weights = normalize_loss_weights(
+        loss_weights = loss_weights_from_mapping(
             {
                 "data": args.w_data,
                 "physics": args.w_physics,
@@ -790,23 +864,23 @@ if __name__ == "__main__":
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
 
+    config = build_run_config(
+        backend=args.backend,
+        n_epochs=args.epochs,
+        seed=args.seed,
+        loss_weights=loss_weights,
+    )
+
     if args.seeds:
         results = run_seed_sweep(
             backend=args.backend,
             seeds=args.seeds,
-            n_epochs=args.epochs,
-            loss_weights=loss_weights,
+            config=config,
         )
     elif args.backend == "both":
-        results = compare_backends(
-            n_epochs=args.epochs,
-            loss_weights=loss_weights,
-            seed=args.seed,
-        )
+        results = compare_backends(config=config)
     else:
         results = run_single_backend(
             backend=args.backend,
-            n_epochs=args.epochs,
-            loss_weights=loss_weights,
-            seed=args.seed,
+            config=config,
         )
