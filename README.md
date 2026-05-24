@@ -1,4 +1,4 @@
-# Backend-Agnostic Inverse 1D Burgers Solver via Tesseract (Viscosity Estimation with JAX and PyTorch PINNs)
+# Backend-Agnostic Inverse Burgers PINN with Tesseract
 
 [![tesseract-core v1.2.0](https://img.shields.io/badge/tesseract--core-v1.2.0-blue)](https://github.com/pasteurlabs/tesseract-core)
 [![tesseract-jax v0.2.3](https://img.shields.io/badge/tesseract--jax-v0.2.3-green)](https://github.com/pasteurlabs/tesseract-jax)
@@ -7,13 +7,13 @@
 [![Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-orange.svg)](LICENSE)
 
 **Overview**
-This project demonstrates pipeline-level automatic differentiation across frameworks using Tesseract. An inverse 1D viscous Burgers equation solver (Inferring viscosity coefficient via physics-informed neural networks) runs with either JAX or PyTorch PINN backends while maintaining identical optimization code. When the PyTorch backend is selected, JAX gradients are computed through the Tesseract VJP interface, enabling cross-framework automatic differentiation.
+This project estimates the viscosity coefficient of the 1D viscous Burgers equation from noisy observations. The inverse solver uses a physics-informed neural network (PINN) exposed as a Tesseract, with interchangeable JAX and PyTorch backends. The outer optimization loop stays in JAX; when the PyTorch backend runs, Tesseract routes gradients through the PyTorch VJP endpoint.
 
 **Key implementations:**
-- Implementation of `apply`, `vector_jacobian_product`, and `jacobian_vector_product` endpoints for both JAX and PyTorch PINNs
-- Differentiable pseudospectral Burgers solver Tesseract for generating nonlinear ground-truth observations
-- Demonstration of JAX optimizer computing gradients through PyTorch models via Tesseract's VJP endpoint
-- Backend-agnostic inverse problem pipeline with swappable implementations (Pytorch/Jax) 
+- JAX and PyTorch PINN Tesseracts with `apply`, `vector_jacobian_product`, and `jacobian_vector_product` endpoints
+- Differentiable pseudospectral Burgers solver Tesseract for solver-generated observations
+- One JAX inverse-training loop that can optimize through either PINN backend
+- Configurable loss weights, `log_nu` optimization, seeded runs, and seed-sweep summaries
 
 ---
 
@@ -21,9 +21,11 @@ This project demonstrates pipeline-level automatic differentiation across framew
 
 - [Problem Statement](#problem-statement)
 - [Implementation](#implementation)
+- [Configuration](#configuration)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Results](#results)
+- [Current Status](#current-status)
 - [References](#references)
 
 ---
@@ -42,7 +44,7 @@ where:
 - Initial condition: $u(x, 0) = \sin(2\pi x)$
 - Boundary conditions: periodic on $[0, 1]$
 
-Synthetic observations are generated from a differentiable pseudospectral Burgers solver with FFT spatial derivatives, 2/3 dealiasing, and adaptive Diffrax time integration. The solver uses the same sinusoidal initial condition and periodic boundary conditions as the PINN loss, then samples noisy observations from the nonlinear solution field with additive Gaussian noise ($\sigma = 0.02$). This provides solver ground truth with known $\nu$ for validating the inverse solver.
+Synthetic observations come from a differentiable pseudospectral Burgers solver with FFT spatial derivatives, 2/3 dealiasing, and adaptive Diffrax time integration. The solver uses the same sinusoidal initial condition and periodic boundary conditions as the PINN loss. The inverse pipeline samples noisy observations from the nonlinear solution field with additive Gaussian noise, using $\sigma = 0.02$ by default.
 
 A physics-informed neural network (PINN) minimizes a combined loss function:
 
@@ -78,7 +80,7 @@ The `pinn_jax` and `pinn_pytorch` Tesseracts implement:
 
 1. **apply(inputs)**: Forward pass returning u_pred, u_x, u_t, u_xx
 2. **vector_jacobian_product(...)**: Reverse-mode AD for gradient computation
-3. **jacobian_vector_product(...)**: Forward-mode AD for sensitivity analysis etc (not used in this project)
+3. **jacobian_vector_product(...)**: Forward-mode AD for sensitivity analysis (not used by the inverse trainer)
 
 The `burgers_solver` Tesseract implements the same `apply`, VJP, and JVP endpoint pattern for differentiable solver runs. In the current inverse-problem demo it is used offline to generate ground-truth observations; differentiating through the solver during optimization is a planned extension.
 
@@ -86,32 +88,42 @@ Input/output schemas use Tesseract's `Differentiable[Array[...]]` annotations to
 
 ### Cross-Framework Gradient Flow
 
-The optimization loop in `inverse_problem.py` demonstrates Tesseract-mediated gradient computation:
+The CLI path in `inverse_problem.py` optimizes the viscosity in log space:
 
 ```python
 # Load backend (JAX or PyTorch)
 pinn = Tesseract.from_image("pinn_jax")  # or "pinn_pytorch"
 
-# Define loss using Tesseract apply
-def compute_loss(viscosity, params, ...):
-    result = apply_tesseract(pinn, {"x": x, "t": t, "params_flat": params})
-    # ... compute data + physics + IC + BC losses
-    return total_loss
+# Keep viscosity positive without clipping the optimized variable
+nu = jnp.exp(log_nu)
+loss = compute_loss(nu, params, x_obs, t_obs, u_obs, ..., pinn)
 
 # System-level gradients computed via Tesseract VJP (regardless of backend)
-grad_visc = jax.grad(compute_loss, argnums=0)    # ∂L/∂ν
-grad_params = jax.grad(compute_loss, argnums=1)  # ∂L/∂params
+grad_log_nu = jax.grad(compute_loss_from_log_viscosity, argnums=0)
+grad_params = jax.grad(compute_loss, argnums=1)
 
 # When jax.grad is called, it triggers Tesseract's VJP endpoint
 # For PyTorch backend: Tesseract VJP internally uses torch.autograd.grad
 # For JAX backend: Tesseract VJP internally uses jax.grad
-v_grad = grad_visc(viscosity, params, ...)
-p_grad = grad_params(viscosity, params, ...)
+log_nu_grad = grad_log_nu(log_nu, params, ...)
+p_grad = grad_params(nu, params, ...)
 ```
 
-> **Key point:** The system-level gradients ($\partial \mathcal{L}/\partial \nu$ and $\partial \mathcal{L}/\partial \text{params}$) are computed through Tesseract's `vector_jacobian_product` endpoint for both backends. The backend selection only determines which autograd implementation Tesseract uses internally for its VJP computation.
+> **Key point:** The system-level gradients ($\partial \mathcal{L}/\partial \log\nu$ and $\partial \mathcal{L}/\partial \text{params}$) use Tesseract's `vector_jacobian_product` endpoint for both backends. The backend selection determines which autograd implementation Tesseract uses inside the VJP computation.
 
 The inverse loop optimizes `log_nu` and evaluates the PDE residual with `nu = exp(log_nu)`. This keeps the inferred viscosity positive without clipping the optimization variable.
+
+### Configuration
+
+Run settings live in typed dataclasses in `configs.py`:
+
+- `ProblemConfig`: true viscosity, initial viscosity, and domain
+- `DataConfig`: observation count, noise level, and seed
+- `TrainingConfig`: epochs, learning rates, and collocation/IC/BC sample counts
+- `LossWeights`: data, physics, initial-condition, and boundary-condition weights
+- `RunConfig`: full run configuration consumed by `inverse_problem.py`
+
+The CLI still exposes the common knobs directly. Internally, `inverse_problem.py` converts CLI arguments into a `RunConfig`, so Streamlit or future scripts can call the same training path without duplicating defaults.
 
 ### Project Structure
 
@@ -141,20 +153,20 @@ tesseract-pinn-inverse-burgers/
 
 ## Installation
 
-**Requirements:** Python ≥3.10, Docker. (Optionally: uv for its venv/pip shims)
+**Requirements:** Python >=3.13, Docker, and the Tesseract CLI.
 
 ```bash
 # Clone repository
 git clone https://github.com/julian-8897/tesseract-pinn-inverse-burgers.git
 cd tesseract-pinn-inverse-burgers
 
-# Option A — using uv (recommended if you use uv workflow)
+# Option A: using uv
 # Install uv if missing: pip install uv
 uv venv
 source .venv/bin/activate
 uv pip install -e .
 
-# Option B (python venv)
+# Option B: using python venv
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -170,43 +182,51 @@ docker images | grep -E 'burgers_solver|pinn'
 
 ## Usage
 
-### via CLI
+### CLI
 
 ```bash
 # Compare both backends
-python inverse_problem.py --backend both --epochs 100
+uv run python inverse_problem.py --backend both --epochs 100
 
 # Single backend
-python inverse_problem.py --backend jax --epochs 50
-python inverse_problem.py --backend pytorch --epochs 50
+uv run python inverse_problem.py --backend jax --epochs 50
+uv run python inverse_problem.py --backend pytorch --epochs 50
 
 # Reproducible single-seed run
-python inverse_problem.py --backend jax --epochs 50 --seed 123
+uv run python inverse_problem.py --backend jax --epochs 50 --seed 123
 
 # Override PINN loss weights
-python inverse_problem.py --backend jax --epochs 50 \
+uv run python inverse_problem.py --backend jax --epochs 50 \
   --w-data 1.0 --w-physics 0.2 --w-ic 0.5 --w-bc 0.5
 
 # Seed sweep with summary statistics
-python inverse_problem.py --backend jax --epochs 50 --seeds 0 1 2 3 4
+uv run python inverse_problem.py --backend jax --epochs 50 --seeds 0 1 2 3 4
 ```
 
-### via Streamlit
+### Streamlit
 
 ```bash
-streamlit run app.py
+uv run streamlit run app.py
 ```
 
 The Streamlit app provides:
 - Adjustable hyperparameters (viscosity, noise, learning rate)
 - Real-time training visualization
 - Gradient flow inspector (Tesseract API call statistics)
-- Solution comparison (PINN vs solver ground truth)
+- Solution comparison plots
+
+The CLI is the reference path for the current solver-backed observations, dataclass configs, seeded runs, and `log_nu` optimization. The Streamlit app still needs a cleanup pass to remove older analytical-reference labels and fully match the CLI pipeline.
+
+### Tests
+
+```bash
+uv run --with pytest python -m pytest tests -q
+```
 
 ---
 
 ## Results
-PINN inferred viscosity converges close to ground truth $(\nu = 0.05)$ for both backends after 100 epochs:
+The repository includes example figures from the PINN comparison workflow:
 <table align="center" cellpadding="12">
   <tr>
     <td align="center">
@@ -216,7 +236,7 @@ PINN inferred viscosity converges close to ground truth $(\nu = 0.05)$ for both 
   </tr>
 </table>
 
-PINN $u(x,t)$ solutions vs solver ground truth for both backends, green points indicate noisy observations:
+PINN $u(x,t)$ solution plots for both backends:
 <table align="center" cellpadding="12">
   <tr>
     <td align="center">
@@ -235,14 +255,22 @@ PINN $u(x,t)$ solutions vs solver ground truth for both backends, green points i
   </tr>
 </table>
 
+Regenerate these figures before treating them as benchmark results for the latest CLI path. Recent changes moved observation generation to the Burgers solver, added `log_nu` optimization, and added seed sweeps.
+
+## Current Status
+
+- The CLI inverse pipeline uses solver-generated noisy Burgers observations.
+- The solver generates observations offline for training. End-to-end differentiation through the solver during inverse training remains future work.
+- The PINN backend can be JAX or PyTorch; Tesseract exposes both through the same `apply`/VJP/JVP interface.
+- The Streamlit app is useful for interactive inspection, but it has not yet been fully aligned with the latest CLI refactor.
 
 ## References
 
 **Tesseract Documentation:**
-- [Tesseract Core](https://github.com/pasteurlabs/tesseract-core) — Main repository and CLI
-- [Tesseract-JAX](https://github.com/pasteurlabs/tesseract-jax) — JAX integration layer
-- [Creating Tesseracts](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/content/creating-tesseracts/create.html) — Implementation guide
-- [Differentiable Programming](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/content/introduction/differentiable-programming.html) — VJP/JVP concepts
+- [Tesseract Core](https://github.com/pasteurlabs/tesseract-core) - Main repository and CLI
+- [Tesseract-JAX](https://github.com/pasteurlabs/tesseract-jax) - JAX integration layer
+- [Creating Tesseracts](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/content/creating-tesseracts/create.html) - Implementation guide
+- [Differentiable Programming](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/content/introduction/differentiable-programming.html) - VJP/JVP concepts
 
 **Related Publications to PINNs:**
 - Raissi, M., Perdikaris, P., & Karniadakis, G. E., ["Physics-informed neural networks: A deep learning framework for solving forward and inverse problems involving nonlinear partial differential equations"](https://www.sciencedirect.com/science/article/pii/S0021999118307125), *Journal of Computational Physics* 378 (2019): 686-707
@@ -256,7 +284,7 @@ PINN $u(x,t)$ solutions vs solver ground truth for both backends, green points i
 |-----------|---------|-------|
 | tesseract-core | 1.2.0 | Runtime and CLI |
 | tesseract-jax | 0.2.3 | JAX integration |
-| Python | ≥3.10 | Type hints required |
+| Python | >=3.13 | Project requirement in `pyproject.toml` |
 | Docker | latest | Container execution |
 | JAX | 0.8.2 | CPU backend |
 | PyTorch | 2.9.1 | PyTorch backend |
