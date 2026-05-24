@@ -14,6 +14,7 @@ import time
 from collections.abc import Mapping
 from math import isfinite
 from pathlib import Path
+from statistics import fmean, pstdev
 
 import jax
 import jax.numpy as jnp
@@ -76,7 +77,7 @@ def format_loss_weights(loss_weights):
     return ", ".join(f"{name}={loss_weights[name]:g}" for name in LOSS_WEIGHT_NAMES)
 
 
-def log_run_header(backend, true_viscosity, initial_viscosity, loss_weights):
+def log_run_header(backend, true_viscosity, initial_viscosity, loss_weights, seed):
     """Log the inverse-problem run configuration."""
     CONSOLE.rule(f"[bold cyan]Inverse Problem: {backend.upper()} PINN")
     table = Table(show_header=False, box=None, padding=(0, 2))
@@ -85,6 +86,7 @@ def log_run_header(backend, true_viscosity, initial_viscosity, loss_weights):
     table.add_row("True viscosity", f"ν = {true_viscosity:.6f}")
     table.add_row("Initial guess", f"ν = {initial_viscosity:.6f}")
     table.add_row("Loss weights", format_loss_weights(loss_weights))
+    table.add_row("Seed", str(seed))
     CONSOLE.print(table)
 
 
@@ -150,6 +152,56 @@ def log_backend_comparison(results):
     CONSOLE.print(table)
 
 
+def summarize_seed_results(results):
+    """Aggregate repeated inverse runs by backend."""
+    summary = {}
+    backends = sorted({result["backend"] for result in results})
+
+    for backend in backends:
+        backend_results = [
+            result for result in results if result["backend"] == backend
+        ]
+        viscosities = [result["final_viscosity"] for result in backend_results]
+        errors = [result["relative_error"] for result in backend_results]
+        times = [result["avg_time_ms"] for result in backend_results]
+        summary[backend] = {
+            "runs": len(backend_results),
+            "mean_viscosity": fmean(viscosities),
+            "std_viscosity": pstdev(viscosities),
+            "mean_relative_error": fmean(errors),
+            "std_relative_error": pstdev(errors),
+            "mean_time_ms": fmean(times),
+        }
+
+    return summary
+
+
+def log_seed_summary(results):
+    """Log mean/std metrics for a seed sweep."""
+    summary = summarize_seed_results(results)
+    table = Table(title="Seed Sweep Summary")
+    table.add_column("Backend", style="bold")
+    table.add_column("Runs", justify="right")
+    table.add_column("Mean ν", justify="right", style="cyan")
+    table.add_column("Std ν", justify="right")
+    table.add_column("Mean error (%)", justify="right", style="cyan")
+    table.add_column("Std error (%)", justify="right")
+    table.add_column("Mean time/epoch (ms)", justify="right")
+
+    for backend, values in summary.items():
+        table.add_row(
+            backend,
+            str(values["runs"]),
+            f"{values['mean_viscosity']:.6f}",
+            f"{values['std_viscosity']:.6f}",
+            f"{values['mean_relative_error']:.2f}",
+            f"{values['std_relative_error']:.2f}",
+            f"{values['mean_time_ms']:.1f}",
+        )
+
+    CONSOLE.print(table)
+
+
 def get_burgers_solver():
     """Import the solver without leaving a conflicting tesseract_api module loaded."""
     solver_path = str(REPO_ROOT / "tesseracts" / "burgers_solver")
@@ -168,13 +220,13 @@ def get_burgers_solver():
     return solve_burgers
 
 
-def get_initial_params(backend="jax"):
+def get_initial_params(backend="jax", seed=42):
     """Get initial parameters for the specified backend."""
     if backend == "jax":
         sys.path.insert(0, "tesseracts/pinn_jax")
         from tesseract_api import PINNNet, flatten_params
 
-        model = PINNNet(jax.random.PRNGKey(42))
+        model = PINNNet(jax.random.PRNGKey(seed))
         params = flatten_params(model)
         sys.path.pop(0)
         # Clear the imported module to avoid conflicts
@@ -186,8 +238,8 @@ def get_initial_params(backend="jax"):
         sys.path.insert(0, "tesseracts/pinn_pytorch")
         from tesseract_api import PINNNet, flatten_params
 
-        torch.manual_seed(42)
-        model = PINNNet(hidden_sizes=[64, 64, 64], n_fourier_features=32, seed=42)
+        torch.manual_seed(seed)
+        model = PINNNet(hidden_sizes=[64, 64, 64], n_fourier_features=32, seed=seed)
         params = flatten_params(model)
         sys.path.pop(0)
         # Clear the imported module to avoid conflicts
@@ -409,6 +461,7 @@ def run_inverse_problem(
     n_epochs=200,
     learning_rate=0.1,
     loss_weights=None,
+    seed=123,
 ):
     """
     Run inverse problem to infer viscosity parameter.
@@ -421,17 +474,21 @@ def run_inverse_problem(
     if initial_viscosity <= 0:
         raise ValueError("initial_viscosity must be positive when optimizing log_nu")
 
-    log_run_header(backend, true_viscosity, initial_viscosity, loss_weights)
+    log_run_header(backend, true_viscosity, initial_viscosity, loss_weights, seed)
 
     # Make observations and collocation points
-    key = jax.random.PRNGKey(123)
-    x_obs, t_obs, u_obs = generate_observations(n_obs, true_viscosity, domain, key)
-    key_col, key_ic, key_bc = jax.random.split(key, 3)
+    key = jax.random.PRNGKey(seed)
+    key_obs, key_col_x, key_col_t, key_ic, key_bc = jax.random.split(key, 5)
+    x_obs, t_obs, u_obs = generate_observations(
+        n_obs, true_viscosity, domain, key_obs
+    )
     n_col = 200
     x_col = jax.random.uniform(
-        key_col, (n_col,), minval=domain["x"][0], maxval=domain["x"][1]
+        key_col_x, (n_col,), minval=domain["x"][0], maxval=domain["x"][1]
     )
-    t_col = jax.random.uniform(key_col, (n_col,), minval=0.05, maxval=domain["t"][1])
+    t_col = jax.random.uniform(
+        key_col_t, (n_col,), minval=0.05, maxval=domain["t"][1]
+    )
 
     n_ic = 50
     x_ic = jax.random.uniform(
@@ -444,7 +501,7 @@ def run_inverse_problem(
     image_name = "pinn_jax" if backend == "jax" else "pinn_pytorch"
     pinn = Tesseract.from_image(image_name)
 
-    params_flat = get_initial_params(backend)
+    params_flat = get_initial_params(backend, seed=seed)
     CONSOLE.log(f"Model parameters: {params_flat.size}")
 
     log_viscosity = jnp.log(jnp.asarray(initial_viscosity))
@@ -579,10 +636,11 @@ def run_inverse_problem(
         "log_viscosity_history": log_viscosity_history,
         "loss_history": loss_history,
         "loss_weights": loss_weights,
+        "seed": seed,
     }
 
 
-def compare_backends(n_epochs=50, n_obs=80, loss_weights=None):
+def compare_backends(n_epochs=50, n_obs=80, loss_weights=None, seed=123):
     """Run inverse problem with both backends for comparison."""
     loss_weights = normalize_loss_weights(loss_weights)
 
@@ -598,6 +656,7 @@ def compare_backends(n_epochs=50, n_obs=80, loss_weights=None):
         n_obs=n_obs,
         n_epochs=n_epochs,
         loss_weights=loss_weights,
+        seed=seed,
     )
 
     # Run PyTorch PINN
@@ -608,6 +667,7 @@ def compare_backends(n_epochs=50, n_obs=80, loss_weights=None):
         n_obs=n_obs,
         n_epochs=n_epochs,
         loss_weights=loss_weights,
+        seed=seed,
     )
 
     log_backend_comparison(results)
@@ -630,7 +690,7 @@ def compare_backends(n_epochs=50, n_obs=80, loss_weights=None):
     return results
 
 
-def run_single_backend(backend="jax", n_epochs=50, loss_weights=None):
+def run_single_backend(backend="jax", n_epochs=50, loss_weights=None, seed=123):
     """Run inverse problem with a single backend only."""
     return run_inverse_problem(
         backend=backend,
@@ -639,7 +699,34 @@ def run_single_backend(backend="jax", n_epochs=50, loss_weights=None):
         n_obs=80,
         n_epochs=n_epochs,
         loss_weights=loss_weights,
+        seed=seed,
     )
+
+
+def run_seed_sweep(backend="jax", seeds=(123,), n_epochs=50, loss_weights=None):
+    """Run one backend or both backends across multiple random seeds."""
+    results = []
+
+    for seed in seeds:
+        if backend == "both":
+            backend_results = compare_backends(
+                n_epochs=n_epochs,
+                loss_weights=loss_weights,
+                seed=seed,
+            )
+            results.extend(backend_results.values())
+        else:
+            results.append(
+                run_single_backend(
+                    backend=backend,
+                    n_epochs=n_epochs,
+                    loss_weights=loss_weights,
+                    seed=seed,
+                )
+            )
+
+    log_seed_summary(results)
+    return results
 
 
 if __name__ == "__main__":
@@ -653,6 +740,18 @@ if __name__ == "__main__":
         help="Which backend to use",
     )
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=123,
+        help="Random seed for observations, collocation points, and model init",
+    )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        help="Run a seed sweep with one or more random seeds",
+    )
     parser.add_argument(
         "--w-data",
         type=float,
@@ -691,11 +790,23 @@ if __name__ == "__main__":
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
 
-    if args.backend == "both":
-        results = compare_backends(n_epochs=args.epochs, loss_weights=loss_weights)
+    if args.seeds:
+        results = run_seed_sweep(
+            backend=args.backend,
+            seeds=args.seeds,
+            n_epochs=args.epochs,
+            loss_weights=loss_weights,
+        )
+    elif args.backend == "both":
+        results = compare_backends(
+            n_epochs=args.epochs,
+            loss_weights=loss_weights,
+            seed=args.seed,
+        )
     else:
         results = run_single_backend(
             backend=args.backend,
             n_epochs=args.epochs,
             loss_weights=loss_weights,
+            seed=args.seed,
         )

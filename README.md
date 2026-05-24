@@ -179,9 +179,15 @@ python inverse_problem.py --backend both --epochs 100
 python inverse_problem.py --backend jax --epochs 50
 python inverse_problem.py --backend pytorch --epochs 50
 
+# Reproducible single-seed run
+python inverse_problem.py --backend jax --epochs 50 --seed 123
+
 # Override PINN loss weights
 python inverse_problem.py --backend jax --epochs 50 \
   --w-data 1.0 --w-physics 0.2 --w-ic 0.5 --w-bc 0.5
+
+# Seed sweep with summary statistics
+python inverse_problem.py --backend jax --epochs 50 --seeds 0 1 2 3 4
 ```
 
 ### via Streamlit
