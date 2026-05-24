@@ -46,7 +46,7 @@ Synthetic observations are generated from a differentiable pseudospectral Burger
 
 A physics-informed neural network (PINN) minimizes a combined loss function:
 
-$$\mathcal{L} = \mathcal{L}_{\text{data}} + \lambda_{\text{physics}} \cdot \mathcal{L}_{\text{physics}} + \lambda_{\text{IC}} \cdot \mathcal{L}_{\text{IC}} + \lambda_{\text{BC}} \cdot \mathcal{L}_{\text{BC}}$$
+$$\mathcal{L} = \lambda_{\text{data}} \cdot \mathcal{L}_{\text{data}} + \lambda_{\text{physics}} \cdot \mathcal{L}_{\text{physics}} + \lambda_{\text{IC}} \cdot \mathcal{L}_{\text{IC}} + \lambda_{\text{BC}} \cdot \mathcal{L}_{\text{BC}}$$
 
 where:
 - $\mathcal{L}_{\text{data}}$: mean squared error between predictions and observations
@@ -176,6 +176,10 @@ python inverse_problem.py --backend both --epochs 100
 # Single backend
 python inverse_problem.py --backend jax --epochs 50
 python inverse_problem.py --backend pytorch --epochs 50
+
+# Override PINN loss weights
+python inverse_problem.py --backend jax --epochs 50 \
+  --w-data 1.0 --w-physics 0.2 --w-ic 0.5 --w-bc 0.5
 ```
 
 ### via Streamlit

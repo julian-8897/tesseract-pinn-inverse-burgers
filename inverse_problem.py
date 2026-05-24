@@ -11,6 +11,8 @@ in Burgers equation: ∂u/∂t + u·∂u/∂x = ν·∂²u/∂x²
 
 import sys
 import time
+from collections.abc import Mapping
+from math import isfinite
 from pathlib import Path
 
 import jax
@@ -38,9 +40,43 @@ DEFAULT_LOSS_WEIGHTS = {
     "ic": 0.5,
     "bc": 0.5,
 }
+LOSS_WEIGHT_NAMES = tuple(DEFAULT_LOSS_WEIGHTS)
 
 
-def log_run_header(backend, true_viscosity, initial_viscosity):
+def normalize_loss_weights(loss_weights=None):
+    """Return validated non-negative loss weights with defaults filled in."""
+    if loss_weights is None:
+        loss_weights = {}
+    if not isinstance(loss_weights, Mapping):
+        raise TypeError(
+            "loss_weights must be a mapping of loss component names to weights"
+        )
+
+    unknown = set(loss_weights) - set(LOSS_WEIGHT_NAMES)
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"Unknown loss weight(s): {names}")
+
+    normalized = DEFAULT_LOSS_WEIGHTS.copy()
+    normalized.update(loss_weights)
+
+    for name, value in normalized.items():
+        value = float(value)
+        if not isfinite(value):
+            raise ValueError(f"Loss weight '{name}' must be finite")
+        if value < 0:
+            raise ValueError(f"Loss weight '{name}' must be non-negative")
+        normalized[name] = value
+
+    return normalized
+
+
+def format_loss_weights(loss_weights):
+    """Format loss weights for compact CLI output."""
+    return ", ".join(f"{name}={loss_weights[name]:g}" for name in LOSS_WEIGHT_NAMES)
+
+
+def log_run_header(backend, true_viscosity, initial_viscosity, loss_weights):
     """Log the inverse-problem run configuration."""
     CONSOLE.rule(f"[bold cyan]Inverse Problem: {backend.upper()} PINN")
     table = Table(show_header=False, box=None, padding=(0, 2))
@@ -48,6 +84,7 @@ def log_run_header(backend, true_viscosity, initial_viscosity):
     table.add_column("Value", style="cyan")
     table.add_row("True viscosity", f"ν = {true_viscosity:.6f}")
     table.add_row("Initial guess", f"ν = {initial_viscosity:.6f}")
+    table.add_row("Loss weights", format_loss_weights(loss_weights))
     CONSOLE.print(table)
 
 
@@ -222,7 +259,7 @@ def compute_loss_components(
 
     All terms are differentiable with respect to viscosity.
     """
-    weights = DEFAULT_LOSS_WEIGHTS if loss_weights is None else loss_weights
+    weights = normalize_loss_weights(loss_weights)
 
     # Data loss
     result_obs = apply_tesseract(
@@ -341,6 +378,7 @@ def run_inverse_problem(
     n_obs=100,
     n_epochs=200,
     learning_rate=0.001,
+    loss_weights=None,
 ):
     """
     Run inverse problem to infer viscosity parameter.
@@ -349,8 +387,9 @@ def run_inverse_problem(
         backend: "jax" or "pytorch" - which PINN tesseract to use
     """
     domain = {"x": (0.0, 1.0), "t": (0.0, 1.0)}
+    loss_weights = normalize_loss_weights(loss_weights)
 
-    log_run_header(backend, true_viscosity, initial_viscosity)
+    log_run_header(backend, true_viscosity, initial_viscosity, loss_weights)
 
     # Make observations and collocation points
     key = jax.random.PRNGKey(123)
@@ -422,6 +461,7 @@ def run_inverse_problem(
                     x_ic,
                     t_bc,
                     pinn,
+                    loss_weights=loss_weights,
                 )
                 p_grad = grad_params(
                     viscosity,
@@ -434,6 +474,7 @@ def run_inverse_problem(
                     x_ic,
                     t_bc,
                     pinn,
+                    loss_weights=loss_weights,
                 )
 
                 # Both viscosity and parameters are updated
@@ -465,6 +506,7 @@ def run_inverse_problem(
                         x_ic,
                         t_bc,
                         pinn,
+                        loss_weights=loss_weights,
                     )
                     for name, value in loss_components.items():
                         loss_history[name].append(float(value))
@@ -499,11 +541,13 @@ def run_inverse_problem(
         "avg_time_ms": avg_time,
         "viscosity_history": viscosity_history,
         "loss_history": loss_history,
+        "loss_weights": loss_weights,
     }
 
 
-def compare_backends(n_epochs=50, n_obs=80):
+def compare_backends(n_epochs=50, n_obs=80, loss_weights=None):
     """Run inverse problem with both backends for comparison."""
+    loss_weights = normalize_loss_weights(loss_weights)
 
     CONSOLE.rule("[bold cyan]Cross-Framework Autodiff Comparison")
 
@@ -516,6 +560,7 @@ def compare_backends(n_epochs=50, n_obs=80):
         initial_viscosity=0.01,
         n_obs=n_obs,
         n_epochs=n_epochs,
+        loss_weights=loss_weights,
     )
 
     # Run PyTorch PINN
@@ -525,15 +570,17 @@ def compare_backends(n_epochs=50, n_obs=80):
         initial_viscosity=0.01,
         n_obs=n_obs,
         n_epochs=n_epochs,
+        loss_weights=loss_weights,
     )
 
     log_backend_comparison(results)
 
-    speedup = results["pytorch"]["avg_time_ms"] / results["jax"]["avg_time_ms"]
-    if speedup > 1:
-        CONSOLE.log(f"JAX is {speedup:.1f}x faster than PyTorch")
-    else:
-        CONSOLE.log(f"PyTorch is {1 / speedup:.1f}x faster than JAX")
+    if results["jax"]["avg_time_ms"] > 0 and results["pytorch"]["avg_time_ms"] > 0:
+        speedup = results["pytorch"]["avg_time_ms"] / results["jax"]["avg_time_ms"]
+        if speedup > 1:
+            CONSOLE.log(f"JAX is {speedup:.1f}x faster than PyTorch")
+        else:
+            CONSOLE.log(f"PyTorch is {1 / speedup:.1f}x faster than JAX")
 
     CONSOLE.print(
         "\n[bold]Notes[/bold]\n"
@@ -546,7 +593,7 @@ def compare_backends(n_epochs=50, n_obs=80):
     return results
 
 
-def run_single_backend(backend="jax", n_epochs=50):
+def run_single_backend(backend="jax", n_epochs=50, loss_weights=None):
     """Run inverse problem with a single backend only."""
     return run_inverse_problem(
         backend=backend,
@@ -554,6 +601,7 @@ def run_single_backend(backend="jax", n_epochs=50):
         initial_viscosity=0.01,
         n_obs=80,
         n_epochs=n_epochs,
+        loss_weights=loss_weights,
     )
 
 
@@ -568,9 +616,49 @@ if __name__ == "__main__":
         help="Which backend to use",
     )
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument(
+        "--w-data",
+        type=float,
+        default=DEFAULT_LOSS_WEIGHTS["data"],
+        help="Data loss weight",
+    )
+    parser.add_argument(
+        "--w-physics",
+        type=float,
+        default=DEFAULT_LOSS_WEIGHTS["physics"],
+        help="Physics residual loss weight",
+    )
+    parser.add_argument(
+        "--w-ic",
+        type=float,
+        default=DEFAULT_LOSS_WEIGHTS["ic"],
+        help="Initial-condition loss weight",
+    )
+    parser.add_argument(
+        "--w-bc",
+        type=float,
+        default=DEFAULT_LOSS_WEIGHTS["bc"],
+        help="Boundary-condition loss weight",
+    )
     args = parser.parse_args()
 
+    try:
+        loss_weights = normalize_loss_weights(
+            {
+                "data": args.w_data,
+                "physics": args.w_physics,
+                "ic": args.w_ic,
+                "bc": args.w_bc,
+            }
+        )
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
+
     if args.backend == "both":
-        results = compare_backends(n_epochs=args.epochs)
+        results = compare_backends(n_epochs=args.epochs, loss_weights=loss_weights)
     else:
-        results = run_single_backend(backend=args.backend, n_epochs=args.epochs)
+        results = run_single_backend(
+            backend=args.backend,
+            n_epochs=args.epochs,
+            loss_weights=loss_weights,
+        )
