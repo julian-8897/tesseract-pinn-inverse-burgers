@@ -18,6 +18,13 @@ import jax.numpy as jnp
 import optax
 import torch
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 from tesseract_core import Tesseract
 from tesseract_jax import apply_tesseract
@@ -44,20 +51,19 @@ def log_run_header(backend, true_viscosity, initial_viscosity):
     CONSOLE.print(table)
 
 
-def log_epoch(epoch, loss_components, viscosity, true_viscosity, epoch_time):
-    """Log one training checkpoint with total and component losses."""
-    table = Table(title=f"Epoch {epoch}", show_lines=False)
-    table.add_column("Metric", style="bold")
-    table.add_column("Value", justify="right")
-    table.add_row("total loss", f"{float(loss_components['total']):.6e}")
-    table.add_row("data loss", f"{float(loss_components['data']):.6e}")
-    table.add_row("physics loss", f"{float(loss_components['physics']):.6e}")
-    table.add_row("IC loss", f"{float(loss_components['ic']):.6e}")
-    table.add_row("BC loss", f"{float(loss_components['bc']):.6e}")
-    table.add_row("ν", f"{float(viscosity):.6f}")
-    table.add_row("absolute error", f"{abs(float(viscosity) - true_viscosity):.6f}")
-    table.add_row("epoch time", f"{epoch_time * 1000:.1f} ms")
-    CONSOLE.print(table)
+def make_training_progress():
+    """Create a compact progress display for inverse training."""
+    return Progress(
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TextColumn("loss={task.fields[loss]}"),
+        TextColumn("ν={task.fields[nu]}"),
+        TextColumn("err={task.fields[error]}"),
+        TextColumn("epoch={task.fields[epoch_time]}"),
+        console=CONSOLE,
+    )
 
 
 def log_final_results(
@@ -391,51 +397,21 @@ def run_inverse_problem(
         viscosity_history = [float(viscosity)]
         loss_history = {name: [] for name in ("total", "data", "physics", "ic", "bc")}
 
-        for epoch in range(n_epochs):
-            start_time = time.time()
-
-            # Compute gradients
-            v_grad = grad_visc(
-                viscosity,
-                params_flat,
-                x_obs,
-                t_obs,
-                u_obs,
-                x_col,
-                t_col,
-                x_ic,
-                t_bc,
-                pinn,
-            )
-            p_grad = grad_params(
-                viscosity,
-                params_flat,
-                x_obs,
-                t_obs,
-                u_obs,
-                x_col,
-                t_col,
-                x_ic,
-                t_bc,
-                pinn,
+        with make_training_progress() as progress:
+            task_id = progress.add_task(
+                f"{backend.upper()} training",
+                total=n_epochs,
+                loss="pending",
+                nu=f"{float(viscosity):.6f}",
+                error=f"{abs(float(viscosity) - true_viscosity):.6f}",
+                epoch_time="pending",
             )
 
-            # Both viscosity and parameters are updated
-            visc_updates, visc_opt_state = visc_optimizer.update(v_grad, visc_opt_state)
-            viscosity = optax.apply_updates(viscosity, visc_updates)
-            viscosity = jnp.maximum(viscosity, 1e-6)  # Keep positive
+            for epoch in range(n_epochs):
+                start_time = time.time()
 
-            param_updates, param_opt_state = param_optimizer.update(
-                p_grad, param_opt_state
-            )
-            params_flat = optax.apply_updates(params_flat, param_updates)
-
-            epoch_time = time.time() - start_time
-            times.append(epoch_time)
-            viscosity_history.append(float(viscosity))
-
-            if epoch % 20 == 0 or epoch == n_epochs - 1:
-                loss_components = compute_loss_components(
+                # Compute gradients
+                v_grad = grad_visc(
                     viscosity,
                     params_flat,
                     x_obs,
@@ -447,19 +423,65 @@ def run_inverse_problem(
                     t_bc,
                     pinn,
                 )
-                for name, value in loss_components.items():
-                    loss_history[name].append(float(value))
-                log_epoch(
-                    epoch,
-                    loss_components,
+                p_grad = grad_params(
                     viscosity,
-                    true_viscosity,
-                    epoch_time,
+                    params_flat,
+                    x_obs,
+                    t_obs,
+                    u_obs,
+                    x_col,
+                    t_col,
+                    x_ic,
+                    t_bc,
+                    pinn,
+                )
+
+                # Both viscosity and parameters are updated
+                visc_updates, visc_opt_state = visc_optimizer.update(
+                    v_grad, visc_opt_state
+                )
+                viscosity = optax.apply_updates(viscosity, visc_updates)
+                viscosity = jnp.maximum(viscosity, 1e-6)  # Keep positive
+
+                param_updates, param_opt_state = param_optimizer.update(
+                    p_grad, param_opt_state
+                )
+                params_flat = optax.apply_updates(params_flat, param_updates)
+
+                epoch_time = time.time() - start_time
+                times.append(epoch_time)
+                viscosity_history.append(float(viscosity))
+
+                loss_value = loss_history["total"][-1] if loss_history["total"] else None
+                if epoch % 20 == 0 or epoch == n_epochs - 1:
+                    loss_components = compute_loss_components(
+                        viscosity,
+                        params_flat,
+                        x_obs,
+                        t_obs,
+                        u_obs,
+                        x_col,
+                        t_col,
+                        x_ic,
+                        t_bc,
+                        pinn,
+                    )
+                    for name, value in loss_components.items():
+                        loss_history[name].append(float(value))
+                    loss_value = float(loss_components["total"])
+
+                progress.update(
+                    task_id,
+                    advance=1,
+                    loss=f"{loss_value:.3e}" if loss_value is not None else "pending",
+                    nu=f"{float(viscosity):.6f}",
+                    error=f"{abs(float(viscosity) - true_viscosity):.6f}",
+                    epoch_time=f"{epoch_time * 1000:.0f}ms",
                 )
 
         final_viscosity = float(viscosity)
         relative_error = abs(final_viscosity - true_viscosity) / true_viscosity * 100
-        avg_time = sum(times) / len(times) * 1000
+        avg_time = sum(times) / len(times) * 1000 if times else 0.0
 
         log_final_results(
             final_viscosity,
