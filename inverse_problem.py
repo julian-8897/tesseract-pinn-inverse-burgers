@@ -17,11 +17,94 @@ import jax
 import jax.numpy as jnp
 import optax
 import torch
+from rich.console import Console
+from rich.table import Table
 from tesseract_core import Tesseract
 from tesseract_jax import apply_tesseract
 
 
 REPO_ROOT = Path(__file__).resolve().parent
+CONSOLE = Console()
+DEFAULT_LOSS_WEIGHTS = {
+    "data": 1.0,
+    "physics": 0.1,
+    "ic": 0.5,
+    "bc": 0.5,
+}
+
+
+def log_run_header(backend, true_viscosity, initial_viscosity):
+    """Log the inverse-problem run configuration."""
+    CONSOLE.rule(f"[bold cyan]Inverse Problem: {backend.upper()} PINN")
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Parameter", style="bold")
+    table.add_column("Value", style="cyan")
+    table.add_row("True viscosity", f"ν = {true_viscosity:.6f}")
+    table.add_row("Initial guess", f"ν = {initial_viscosity:.6f}")
+    CONSOLE.print(table)
+
+
+def log_epoch(epoch, loss_components, viscosity, true_viscosity, epoch_time):
+    """Log one training checkpoint with total and component losses."""
+    table = Table(title=f"Epoch {epoch}", show_lines=False)
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right")
+    table.add_row("total loss", f"{float(loss_components['total']):.6e}")
+    table.add_row("data loss", f"{float(loss_components['data']):.6e}")
+    table.add_row("physics loss", f"{float(loss_components['physics']):.6e}")
+    table.add_row("IC loss", f"{float(loss_components['ic']):.6e}")
+    table.add_row("BC loss", f"{float(loss_components['bc']):.6e}")
+    table.add_row("ν", f"{float(viscosity):.6f}")
+    table.add_row("absolute error", f"{abs(float(viscosity) - true_viscosity):.6f}")
+    table.add_row("epoch time", f"{epoch_time * 1000:.1f} ms")
+    CONSOLE.print(table)
+
+
+def log_final_results(
+    final_viscosity, true_viscosity, relative_error, avg_time, loss_history
+):
+    """Log final scalar results and final loss components."""
+    table = Table(title="Results")
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right", style="cyan")
+    table.add_row("Inferred ν", f"{final_viscosity:.6f}")
+    table.add_row("True ν", f"{true_viscosity:.6f}")
+    table.add_row("Relative error", f"{relative_error:.2f}%")
+    table.add_row("Avg time/epoch", f"{avg_time:.1f} ms")
+
+    if loss_history["total"]:
+        table.add_section()
+        table.add_row("total loss", f"{loss_history['total'][-1]:.6e}")
+        table.add_row("data loss", f"{loss_history['data'][-1]:.6e}")
+        table.add_row("physics loss", f"{loss_history['physics'][-1]:.6e}")
+        table.add_row("IC loss", f"{loss_history['ic'][-1]:.6e}")
+        table.add_row("BC loss", f"{loss_history['bc'][-1]:.6e}")
+
+    CONSOLE.print(table)
+
+
+def log_backend_comparison(results):
+    """Log a compact JAX vs PyTorch comparison table."""
+    table = Table(title="JAX vs PyTorch PINN")
+    table.add_column("Metric", style="bold")
+    table.add_column("JAX", justify="right", style="cyan")
+    table.add_column("PyTorch", justify="right", style="magenta")
+    table.add_row(
+        "Inferred viscosity",
+        f"{results['jax']['final_viscosity']:.6f}",
+        f"{results['pytorch']['final_viscosity']:.6f}",
+    )
+    table.add_row(
+        "Relative error (%)",
+        f"{results['jax']['relative_error']:.2f}",
+        f"{results['pytorch']['relative_error']:.2f}",
+    )
+    table.add_row(
+        "Avg time/epoch (ms)",
+        f"{results['jax']['avg_time_ms']:.1f}",
+        f"{results['pytorch']['avg_time_ms']:.1f}",
+    )
+    CONSOLE.print(table)
 
 
 def get_burgers_solver():
@@ -110,10 +193,20 @@ def generate_observations(n_points, true_viscosity, domain, key):
     return x, t, u_observed
 
 
-def compute_loss(
-    viscosity, params_flat, x_obs, t_obs, u_obs, x_col, t_col, x_ic, t_bc, pinn
+def compute_loss_components(
+    viscosity,
+    params_flat,
+    x_obs,
+    t_obs,
+    u_obs,
+    x_col,
+    t_col,
+    x_ic,
+    t_bc,
+    pinn,
+    loss_weights=None,
 ):
-    """Compute total PINN loss for inverse problem.
+    """Compute total and component PINN losses for the inverse problem.
 
     Components:
     1. Data loss: fit observations
@@ -123,6 +216,8 @@ def compute_loss(
 
     All terms are differentiable with respect to viscosity.
     """
+    weights = DEFAULT_LOSS_WEIGHTS if loss_weights is None else loss_weights
+
     # Data loss
     result_obs = apply_tesseract(
         pinn,
@@ -186,10 +281,51 @@ def compute_loss(
     u_right = result_right["u_pred"]
     bc_loss = jnp.mean((u_left - u_right) ** 2)
 
-    # Total Loss with preconfigured weights
-    total_loss = data_loss + 0.1 * physics_loss + 0.5 * ic_loss + 0.5 * bc_loss
+    total_loss = (
+        weights["data"] * data_loss
+        + weights["physics"] * physics_loss
+        + weights["ic"] * ic_loss
+        + weights["bc"] * bc_loss
+    )
 
-    return total_loss
+    return {
+        "total": total_loss,
+        "data": data_loss,
+        "physics": physics_loss,
+        "ic": ic_loss,
+        "bc": bc_loss,
+    }
+
+
+def compute_loss(
+    viscosity,
+    params_flat,
+    x_obs,
+    t_obs,
+    u_obs,
+    x_col,
+    t_col,
+    x_ic,
+    t_bc,
+    pinn,
+    loss_weights=None,
+):
+    """Compute scalar total PINN loss for gradient-based optimization."""
+    components = compute_loss_components(
+        viscosity,
+        params_flat,
+        x_obs,
+        t_obs,
+        u_obs,
+        x_col,
+        t_col,
+        x_ic,
+        t_bc,
+        pinn,
+        loss_weights=loss_weights,
+    )
+
+    return components["total"]
 
 
 def run_inverse_problem(
@@ -208,11 +344,7 @@ def run_inverse_problem(
     """
     domain = {"x": (0.0, 1.0), "t": (0.0, 1.0)}
 
-    print(f"\n{'=' * 60}")
-    print(f"  Inverse Problem: {backend.upper()} PINN")
-    print(f"{'=' * 60}")
-    print(f"True viscosity:    ν = {true_viscosity}")
-    print(f"Initial guess:     ν = {initial_viscosity}")
+    log_run_header(backend, true_viscosity, initial_viscosity)
 
     # Make observations and collocation points
     key = jax.random.PRNGKey(123)
@@ -236,7 +368,7 @@ def run_inverse_problem(
     pinn = Tesseract.from_image(image_name)
 
     params_flat = get_initial_params(backend)
-    print(f"Model parameters: {params_flat.size}")
+    CONSOLE.log(f"Model parameters: {params_flat.size}")
 
     viscosity = jnp.array(initial_viscosity)
 
@@ -252,12 +384,12 @@ def run_inverse_problem(
     grad_params = jax.grad(compute_loss, argnums=1)
 
     with pinn:
-        print(f"\n{backend.upper()} PINN tesseract initialized")
-        print("\nOptimizing...")
-        print("-" * 60)
+        CONSOLE.log(f"{backend.upper()} PINN tesseract initialized")
+        CONSOLE.log("Optimizing...")
 
         times = []
         viscosity_history = [float(viscosity)]
+        loss_history = {name: [] for name in ("total", "data", "physics", "ic", "bc")}
 
         for epoch in range(n_epochs):
             start_time = time.time()
@@ -303,7 +435,7 @@ def run_inverse_problem(
             viscosity_history.append(float(viscosity))
 
             if epoch % 20 == 0 or epoch == n_epochs - 1:
-                loss = compute_loss(
+                loss_components = compute_loss_components(
                     viscosity,
                     params_flat,
                     x_obs,
@@ -315,24 +447,27 @@ def run_inverse_problem(
                     t_bc,
                     pinn,
                 )
-                error = abs(float(viscosity) - true_viscosity)
-                print(
-                    f"Epoch {epoch:4d} | Loss: {float(loss):.6f} | "
-                    f"ν: {float(viscosity):.6f} | Error: {error:.6f} | "
-                    f"Time: {epoch_time * 1000:.1f}ms"
+                for name, value in loss_components.items():
+                    loss_history[name].append(float(value))
+                log_epoch(
+                    epoch,
+                    loss_components,
+                    viscosity,
+                    true_viscosity,
+                    epoch_time,
                 )
-
-        print("-" * 60)
 
         final_viscosity = float(viscosity)
         relative_error = abs(final_viscosity - true_viscosity) / true_viscosity * 100
         avg_time = sum(times) / len(times) * 1000
 
-        print("\nResults:")
-        print(f"  Inferred ν:     {final_viscosity:.6f}")
-        print(f"  True ν:         {true_viscosity:.6f}")
-        print(f"  Relative error: {relative_error:.2f}%")
-        print(f"  Avg time/epoch: {avg_time:.1f}ms")
+        log_final_results(
+            final_viscosity,
+            true_viscosity,
+            relative_error,
+            avg_time,
+            loss_history,
+        )
 
     return {
         "backend": backend,
@@ -341,15 +476,14 @@ def run_inverse_problem(
         "relative_error": relative_error,
         "avg_time_ms": avg_time,
         "viscosity_history": viscosity_history,
+        "loss_history": loss_history,
     }
 
 
 def compare_backends(n_epochs=50, n_obs=80):
     """Run inverse problem with both backends for comparison."""
 
-    print("\n" + "=" * 70)
-    print("  CROSS-FRAMEWORK AUTODIFF COMPARISON")
-    print("=" * 70)
+    CONSOLE.rule("[bold cyan]Cross-Framework Autodiff Comparison")
 
     results = {}
 
@@ -371,37 +505,21 @@ def compare_backends(n_epochs=50, n_obs=80):
         n_epochs=n_epochs,
     )
 
-    # Comparison
-    print("\n" + "=" * 70)
-    print("  COMPARISON: JAX vs PyTorch PINN")
-    print("=" * 70)
-    print(f"\n{'Metric':<25} {'JAX':>15} {'PyTorch':>15}")
-    print("-" * 55)
-    print(
-        f"{'Inferred viscosity':<25} {results['jax']['final_viscosity']:>15.6f} {results['pytorch']['final_viscosity']:>15.6f}"
-    )
-    print(
-        f"{'Relative error (%)':<25} {results['jax']['relative_error']:>15.2f} {results['pytorch']['relative_error']:>15.2f}"
-    )
-    print(
-        f"{'Avg time/epoch (ms)':<25} {results['jax']['avg_time_ms']:>15.1f} {results['pytorch']['avg_time_ms']:>15.1f}"
-    )
+    log_backend_comparison(results)
 
     speedup = results["pytorch"]["avg_time_ms"] / results["jax"]["avg_time_ms"]
     if speedup > 1:
-        print(f"\n→ JAX is {speedup:.1f}x faster than PyTorch")
+        CONSOLE.log(f"JAX is {speedup:.1f}x faster than PyTorch")
     else:
-        print(f"\n→ PyTorch is {1 / speedup:.1f}x faster than JAX")
+        CONSOLE.log(f"PyTorch is {1 / speedup:.1f}x faster than JAX")
 
-    print("\n" + "=" * 70)
-    print("  NOTES")
-    print("=" * 70)
-    print("""
-  The same optimization pipeline executes with both backends.
-  Gradients are computed via Tesseract's VJP endpoint (jax.grad through PyTorch).
-  Backends can be swapped by changing the Tesseract image name.
-  This demonstrates cross-framework automatic differentiation.
-""")
+    CONSOLE.print(
+        "\n[bold]Notes[/bold]\n"
+        "The same optimization pipeline executes with both backends.\n"
+        "Gradients are computed via Tesseract's VJP endpoint "
+        "(jax.grad through PyTorch).\n"
+        "Backends can be swapped by changing the Tesseract image name."
+    )
 
     return results
 
