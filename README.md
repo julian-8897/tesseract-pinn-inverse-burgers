@@ -11,6 +11,7 @@ This project demonstrates pipeline-level automatic differentiation across framew
 
 **Key implementations:**
 - Implementation of `apply`, `vector_jacobian_product`, and `jacobian_vector_product` endpoints for both JAX and PyTorch PINNs
+- Differentiable pseudospectral Burgers solver Tesseract for generating nonlinear ground-truth observations
 - Demonstration of JAX optimizer computing gradients through PyTorch models via Tesseract's VJP endpoint
 - Backend-agnostic inverse problem pipeline with swappable implementations (Pytorch/Jax) 
 
@@ -41,7 +42,7 @@ where:
 - Initial condition: $u(x, 0) = \sin(2\pi x)$
 - Boundary conditions: periodic on $[0, 1]$
 
-Synthetic observations are generated using a heat equation approximation $u(x,t) \approx \sin(2\pi x) \cdot \exp(-\nu(2\pi)^2 t)$, valid for small viscosity, with additive Gaussian noise ($\sigma = 0.02$). This provides ground truth data with known $\nu$ for validating the inverse solver.
+Synthetic observations are generated from a differentiable pseudospectral Burgers solver with FFT spatial derivatives, 2/3 dealiasing, and adaptive Diffrax time integration. The solver uses the same sinusoidal initial condition and periodic boundary conditions as the PINN loss, then samples noisy observations from the nonlinear solution field with additive Gaussian noise ($\sigma = 0.02$). This provides solver ground truth with known $\nu$ for validating the inverse solver.
 
 A physics-informed neural network (PINN) minimizes a combined loss function:
 
@@ -52,9 +53,6 @@ where:
 - $\mathcal{L}_{\text{physics}}$: PDE residual at collocation points
 - $\mathcal{L}_{\text{IC}}$: initial condition violation
 - $\mathcal{L}_{\text{BC}}$: boundary condition violation
-
-> **Note:** <small> In this demo, synthetic data are generated from a heat‑equation approximation of Burgers for small viscosity, which remains smooth and does not exhibit shock formation. The focus is on inverse viscosity estimation and pipeline‑level autodiff, not on resolving nonlinear shock dynamics.
----
 
 ## Implementation
 
@@ -76,11 +74,13 @@ Derivatives ($\partial u/\partial x$, $\partial u/\partial t$, $\partial^2 u/\pa
 
 ### Tesseract Endpoints
 
-Both `pinn_jax` and `pinn_pytorch` implement:
+The `pinn_jax` and `pinn_pytorch` Tesseracts implement:
 
 1. **apply(inputs)**: Forward pass returning u_pred, u_x, u_t, u_xx
 2. **vector_jacobian_product(...)**: Reverse-mode AD for gradient computation
 3. **jacobian_vector_product(...)**: Forward-mode AD for sensitivity analysis etc (not used in this project)
+
+The `burgers_solver` Tesseract implements the same `apply`, VJP, and JVP endpoint pattern for differentiable solver runs. In the current inverse-problem demo it is used offline to generate ground-truth observations; differentiating through the solver during optimization is a planned extension.
 
 Input/output schemas use Tesseract's `Differentiable[Array[...]]` annotations to declare which fields participate in autodiff.
 
@@ -117,9 +117,13 @@ p_grad = grad_params(viscosity, params, ...)
 tesseract-pinn-inverse-burgers/
 ├── inverse_problem.py         # CLI demo comparing JAX/PyTorch backends
 ├── app.py                     # Streamlit interactive interface
-├── buildall.sh                # Builds Docker containers for both backends
+├── buildall.sh                # Builds Docker containers for all Tesseracts
 ├── pyproject.toml
 └── tesseracts/
+    ├── burgers_solver/
+    │   ├── tesseract_api.py        # Differentiable pseudospectral Burgers solver
+    │   ├── tesseract_config.yaml
+    │   └── tesseract_requirements.txt
     ├── pinn_jax/
     │   ├── tesseract_api.py        # JAX/Equinox PINN with Tesseract endpoints
     │   ├── tesseract_config.yaml
@@ -156,7 +160,7 @@ pip install -e .
 ./buildall.sh
 
 # Verify built images
-docker images | grep pinn
+docker images | grep -E 'burgers_solver|pinn'
 ```
 
 ---
@@ -184,7 +188,7 @@ The Streamlit app provides:
 - Adjustable hyperparameters (viscosity, noise, learning rate)
 - Real-time training visualization
 - Gradient flow inspector (Tesseract API call statistics)
-- Solution comparison (PINN vs analytical)
+- Solution comparison (PINN vs solver ground truth)
 
 ---
 
@@ -199,12 +203,12 @@ PINN inferred viscosity converges close to ground truth $(\nu = 0.05)$ for both 
   </tr>
 </table>
 
-PINN $u(x,t)$ solutions vs analytical solution for both backends, green points indicate noisy observations:
+PINN $u(x,t)$ solutions vs solver ground truth for both backends, green points indicate noisy observations:
 <table align="center" cellpadding="12">
   <tr>
     <td align="center">
       <img src="img/pinn_field_solution_jax.png" alt="PINN solution comparison" width="900"/>
-      <div><em>PINN vs Analytical Solution (JAX)</em></div>
+      <div><em>PINN vs Solver Ground Truth (JAX)</em></div>
     </td>
   </tr>
 </table>
@@ -213,7 +217,7 @@ PINN $u(x,t)$ solutions vs analytical solution for both backends, green points i
   <tr>
     <td align="center">
       <img src="img/pinn_field_solution_pytorch.png" alt="PINN solution comparison" width="900"/>
-      <div><em></em>PINN vs Analytical Solution (PyTorch)</div>
+      <div><em>PINN vs Solver Ground Truth (PyTorch)</em></div>
     </td>
   </tr>
 </table>

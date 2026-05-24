@@ -1,0 +1,3 @@
+name: burgers_solver
+version: 0.1.0
+description: "Differentiable JAX pseudospectral solver for periodic 1D viscous Burgers equation"

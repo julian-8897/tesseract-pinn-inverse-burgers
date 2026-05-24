@@ -11,6 +11,7 @@ in Burgers equation: ∂u/∂t + u·∂u/∂x = ν·∂²u/∂x²
 
 import sys
 import time
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -18,6 +19,27 @@ import optax
 import torch
 from tesseract_core import Tesseract
 from tesseract_jax import apply_tesseract
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+
+
+def get_burgers_solver():
+    """Import the solver without leaving a conflicting tesseract_api module loaded."""
+    solver_path = str(REPO_ROOT / "tesseracts" / "burgers_solver")
+    previous_module = sys.modules.pop("tesseract_api", None)
+
+    sys.path.insert(0, solver_path)
+    try:
+        from tesseract_api import solve_burgers
+    finally:
+        sys.path.pop(0)
+        if "tesseract_api" in sys.modules:
+            del sys.modules["tesseract_api"]
+        if previous_module is not None:
+            sys.modules["tesseract_api"] = previous_module
+
+    return solve_burgers
 
 
 def get_initial_params(backend="jax"):
@@ -50,22 +72,36 @@ def get_initial_params(backend="jax"):
 
 def generate_observations(n_points, true_viscosity, domain, key):
     """
-    Generate synthetic observations from analytical solution.
+    Generate synthetic observations from the pseudospectral Burgers solver.
 
-    For Burgers with small viscosity and sinusoidal IC,
-    we use heat equation decay as approximation:
-    u(x,t) ≈ sin(2πx) * exp(-ν * (2π)² * t)
+    The solver uses the same sinusoidal initial condition assumed by the PINN
+    initial-condition loss: u(x, 0) = sin(2πx).
     """
+    nx = 128
+    nt = 64
     keys = jax.random.split(key, 3)
 
-    x = jax.random.uniform(
-        keys[0], (n_points,), minval=domain["x"][0], maxval=domain["x"][1]
+    x_grid = jnp.linspace(
+        domain["x"][0], domain["x"][1], nx, endpoint=False, dtype=jnp.float32
     )
-    t = jax.random.uniform(keys[1], (n_points,), minval=0.05, maxval=domain["t"][1])
+    t_grid = jnp.linspace(domain["t"][0], domain["t"][1], nt, dtype=jnp.float32)
 
-    # Analytical solution (heat equation decay)
-    decay = jnp.exp(-true_viscosity * (2 * jnp.pi) ** 2 * t)
-    u_observed = jnp.sin(2 * jnp.pi * x) * decay
+    solve_burgers = get_burgers_solver()
+    u_field = solve_burgers(
+        jnp.asarray(true_viscosity, dtype=jnp.float32),
+        x_grid,
+        t_grid,
+        jnp.array(1.0, dtype=jnp.float32),
+        jnp.array(0.0, dtype=jnp.float32),
+    )
+
+    x_idx = jax.random.randint(keys[0], (n_points,), minval=0, maxval=nx)
+    min_t_idx = max(1, int(jnp.searchsorted(t_grid, 0.05, side="left")))
+    t_idx = jax.random.randint(keys[1], (n_points,), minval=min_t_idx, maxval=nt)
+
+    x = x_grid[x_idx]
+    t = t_grid[t_idx]
+    u_observed = u_field[t_idx, x_idx]
 
     # Add small noise
     noise = jax.random.normal(keys[2], (n_points,)) * 0.02
