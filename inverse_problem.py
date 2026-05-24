@@ -371,13 +371,43 @@ def compute_loss(
     return components["total"]
 
 
+def compute_loss_from_log_viscosity(
+    log_viscosity,
+    params_flat,
+    x_obs,
+    t_obs,
+    u_obs,
+    x_col,
+    t_col,
+    x_ic,
+    t_bc,
+    pinn,
+    loss_weights=None,
+):
+    """Compute loss while optimizing viscosity in log-space."""
+    viscosity = jnp.exp(log_viscosity)
+    return compute_loss(
+        viscosity,
+        params_flat,
+        x_obs,
+        t_obs,
+        u_obs,
+        x_col,
+        t_col,
+        x_ic,
+        t_bc,
+        pinn,
+        loss_weights=loss_weights,
+    )
+
+
 def run_inverse_problem(
     backend="jax",
     true_viscosity=0.05,
     initial_viscosity=0.01,
     n_obs=100,
     n_epochs=200,
-    learning_rate=0.001,
+    learning_rate=0.1,
     loss_weights=None,
 ):
     """
@@ -388,6 +418,8 @@ def run_inverse_problem(
     """
     domain = {"x": (0.0, 1.0), "t": (0.0, 1.0)}
     loss_weights = normalize_loss_weights(loss_weights)
+    if initial_viscosity <= 0:
+        raise ValueError("initial_viscosity must be positive when optimizing log_nu")
 
     log_run_header(backend, true_viscosity, initial_viscosity, loss_weights)
 
@@ -415,17 +447,18 @@ def run_inverse_problem(
     params_flat = get_initial_params(backend)
     CONSOLE.log(f"Model parameters: {params_flat.size}")
 
-    viscosity = jnp.array(initial_viscosity)
+    log_viscosity = jnp.log(jnp.asarray(initial_viscosity))
+    viscosity = jnp.exp(log_viscosity)
 
-    visc_optimizer = optax.adam(learning_rate)
-    visc_opt_state = visc_optimizer.init(viscosity)
+    log_visc_optimizer = optax.adam(learning_rate)
+    log_visc_opt_state = log_visc_optimizer.init(log_viscosity)
 
     param_optimizer = optax.adam(1e-3)
     param_opt_state = param_optimizer.init(params_flat)
 
     # Gradient functions
     # jax.grad computes gradients through the tesseract VJP endpoint
-    grad_visc = jax.grad(compute_loss, argnums=0)
+    grad_log_visc = jax.grad(compute_loss_from_log_viscosity, argnums=0)
     grad_params = jax.grad(compute_loss, argnums=1)
 
     with pinn:
@@ -434,6 +467,7 @@ def run_inverse_problem(
 
         times = []
         viscosity_history = [float(viscosity)]
+        log_viscosity_history = [float(log_viscosity)]
         loss_history = {name: [] for name in ("total", "data", "physics", "ic", "bc")}
 
         with make_training_progress() as progress:
@@ -450,8 +484,8 @@ def run_inverse_problem(
                 start_time = time.time()
 
                 # Compute gradients
-                v_grad = grad_visc(
-                    viscosity,
+                log_v_grad = grad_log_visc(
+                    log_viscosity,
                     params_flat,
                     x_obs,
                     t_obs,
@@ -463,6 +497,7 @@ def run_inverse_problem(
                     pinn,
                     loss_weights=loss_weights,
                 )
+                viscosity = jnp.exp(log_viscosity)
                 p_grad = grad_params(
                     viscosity,
                     params_flat,
@@ -478,11 +513,11 @@ def run_inverse_problem(
                 )
 
                 # Both viscosity and parameters are updated
-                visc_updates, visc_opt_state = visc_optimizer.update(
-                    v_grad, visc_opt_state
+                log_visc_updates, log_visc_opt_state = log_visc_optimizer.update(
+                    log_v_grad, log_visc_opt_state
                 )
-                viscosity = optax.apply_updates(viscosity, visc_updates)
-                viscosity = jnp.maximum(viscosity, 1e-6)  # Keep positive
+                log_viscosity = optax.apply_updates(log_viscosity, log_visc_updates)
+                viscosity = jnp.exp(log_viscosity)
 
                 param_updates, param_opt_state = param_optimizer.update(
                     p_grad, param_opt_state
@@ -492,6 +527,7 @@ def run_inverse_problem(
                 epoch_time = time.time() - start_time
                 times.append(epoch_time)
                 viscosity_history.append(float(viscosity))
+                log_viscosity_history.append(float(log_viscosity))
 
                 loss_value = loss_history["total"][-1] if loss_history["total"] else None
                 if epoch % 20 == 0 or epoch == n_epochs - 1:
@@ -540,6 +576,7 @@ def run_inverse_problem(
         "relative_error": relative_error,
         "avg_time_ms": avg_time,
         "viscosity_history": viscosity_history,
+        "log_viscosity_history": log_viscosity_history,
         "loss_history": loss_history,
         "loss_weights": loss_weights,
     }

@@ -111,6 +111,8 @@ p_grad = grad_params(viscosity, params, ...)
 
 > **Key point:** The system-level gradients ($\partial \mathcal{L}/\partial \nu$ and $\partial \mathcal{L}/\partial \text{params}$) are computed through Tesseract's `vector_jacobian_product` endpoint for both backends. The backend selection only determines which autograd implementation Tesseract uses internally for its VJP computation.
 
+The inverse loop optimizes `log_nu` and evaluates the PDE residual with `nu = exp(log_nu)`. This keeps the inferred viscosity positive without clipping the optimization variable.
+
 ### Project Structure
 
 ```
