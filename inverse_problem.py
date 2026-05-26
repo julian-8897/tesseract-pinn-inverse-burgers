@@ -50,6 +50,78 @@ def format_loss_weights(loss_weights):
     return ", ".join(f"{name}={loss_weights[name]:g}" for name in LOSS_WEIGHT_NAMES)
 
 
+def loss_weights_to_array(loss_weights):
+    """Return loss weights as a JAX array in canonical component order."""
+    weights = normalize_loss_weights(loss_weights)
+    return jnp.asarray([weights[name] for name in LOSS_WEIGHT_NAMES])
+
+
+def validate_brdr_loss_weights(loss_weights):
+    """BRDR uses fixed coefficients as positive component scaling factors."""
+    weights = loss_weights_to_array(loss_weights)
+    if bool(jnp.any(weights <= 0)):
+        raise ValueError("BRDR adaptive loss weights require positive fixed weights")
+
+
+def initialize_brdr_state(pointwise_losses):
+    """Initialize pointwise BRDR moments and weights."""
+    return {
+        "step": 0,
+        "moment": {
+            name: jnp.zeros_like(losses)
+            for name, losses in pointwise_losses.items()
+        },
+        "weights": {
+            name: jnp.ones_like(losses)
+            for name, losses in pointwise_losses.items()
+        },
+    }
+
+
+def update_brdr_state(state, pointwise_losses, beta_c=0.9999, beta_w=0.999, eps=1e-12):
+    """Update BRDR state from pointwise squared residual losses.
+
+    BRDR computes inverse residual decay rates as loss / sqrt(EMA(loss^2)),
+    normalizes them to unit global mean, and smooths the resulting pointwise
+    weights with an EMA.
+    """
+    step = state["step"] + 1
+    corrected_irdr = {}
+    new_moment = {}
+
+    bias_correction = 1.0 - beta_c**step
+    for name, losses in pointwise_losses.items():
+        losses = jnp.asarray(losses)
+        moment = beta_c * state["moment"][name] + (1.0 - beta_c) * losses**2
+        new_moment[name] = moment
+        corrected_irdr[name] = losses / jnp.sqrt(moment / bias_correction + eps)
+
+    all_irdr = jnp.concatenate(
+        [jnp.ravel(corrected_irdr[name]) for name in LOSS_WEIGHT_NAMES]
+    )
+    mean_irdr = jnp.mean(all_irdr)
+
+    new_weights = {}
+    for name in LOSS_WEIGHT_NAMES:
+        target_weight = corrected_irdr[name] / (mean_irdr + eps)
+        weight = beta_w * state["weights"][name] + (1.0 - beta_w) * target_weight
+        new_weights[name] = weight
+
+    return {
+        "step": step,
+        "moment": new_moment,
+        "weights": new_weights,
+    }
+
+
+def summarize_brdr_weights(brdr_weights):
+    """Return mean BRDR weight by component for logging and plotting."""
+    return {
+        name: float(jnp.mean(brdr_weights[name]))
+        for name in LOSS_WEIGHT_NAMES
+    }
+
+
 def build_run_config(
     config=None,
     *,
@@ -60,6 +132,10 @@ def build_run_config(
     n_epochs=None,
     learning_rate=None,
     param_learning_rate=None,
+    adaptive_loss_weights=None,
+    brdr_beta_c=None,
+    brdr_beta_w=None,
+    brdr_epsilon=None,
     loss_weights=None,
     seed=None,
     noise_std=None,
@@ -98,6 +174,14 @@ def build_run_config(
         training_updates["log_nu_learning_rate"] = learning_rate
     if param_learning_rate is not None:
         training_updates["param_learning_rate"] = param_learning_rate
+    if adaptive_loss_weights is not None:
+        training_updates["adaptive_loss_weights"] = adaptive_loss_weights
+    if brdr_beta_c is not None:
+        training_updates["brdr_beta_c"] = brdr_beta_c
+    if brdr_beta_w is not None:
+        training_updates["brdr_beta_w"] = brdr_beta_w
+    if brdr_epsilon is not None:
+        training_updates["brdr_epsilon"] = brdr_epsilon
     if n_col is not None:
         training_updates["n_col"] = n_col
     if n_ic is not None:
@@ -125,6 +209,10 @@ def log_run_header(config):
     table.add_row("True viscosity", f"ν = {config.problem.true_viscosity:.6f}")
     table.add_row("Initial guess", f"ν = {config.problem.initial_viscosity:.6f}")
     table.add_row("Loss weights", format_loss_weights(loss_weights))
+    table.add_row(
+        "BRDR weights",
+        "yes" if config.training.adaptive_loss_weights else "no",
+    )
     table.add_row("Seed", str(config.data.seed))
     CONSOLE.print(table)
 
@@ -145,7 +233,12 @@ def make_training_progress():
 
 
 def log_final_results(
-    final_viscosity, true_viscosity, relative_error, avg_time, loss_history
+    final_viscosity,
+    true_viscosity,
+    relative_error,
+    avg_time,
+    loss_history,
+    loss_weight_history=None,
 ):
     """Log final scalar results and final loss components."""
     table = Table(title="Results")
@@ -163,6 +256,11 @@ def log_final_results(
         table.add_row("physics loss", f"{loss_history['physics'][-1]:.6e}")
         table.add_row("IC loss", f"{loss_history['ic'][-1]:.6e}")
         table.add_row("BC loss", f"{loss_history['bc'][-1]:.6e}")
+
+    if loss_weight_history:
+        table.add_section()
+        for name in LOSS_WEIGHT_NAMES:
+            table.add_row(f"{name} weight", f"{loss_weight_history[name][-1]:.6g}")
 
     CONSOLE.print(table)
 
@@ -327,7 +425,7 @@ def generate_observations(n_points, true_viscosity, domain, key, noise_std=0.02)
     return x, t, u_observed
 
 
-def compute_loss_components(
+def compute_pointwise_losses(
     viscosity,
     params_flat,
     x_obs,
@@ -338,21 +436,8 @@ def compute_loss_components(
     x_ic,
     t_bc,
     pinn,
-    loss_weights=None,
 ):
-    """Compute total and component PINN losses for the inverse problem.
-
-    Components:
-    1. Data loss: fit observations
-    2. Physics loss: satisfy PDE residual
-    3. Initial condition loss: u(x, 0) = sin(2πx)
-    4. Boundary condition loss: periodic BCs u(0,t) = u(1,t)
-
-    All terms are differentiable with respect to viscosity.
-    """
-    weights = normalize_loss_weights(loss_weights)
-
-    # Data loss
+    """Compute pointwise squared residual losses for each PINN constraint."""
     result_obs = apply_tesseract(
         pinn,
         {
@@ -362,23 +447,20 @@ def compute_loss_components(
         },
     )
     u_pred = result_obs["u_pred"]
-    data_loss = jnp.mean((u_pred - u_obs) ** 2)
+    data_losses = (u_pred - u_obs) ** 2
 
-    # PDE residual loss components
     result_col = apply_tesseract(
         pinn, {"x": x_col, "t": t_col, "params_flat": params_flat}
     )
 
-    u_col = result_col["u_pred"]  # Solution values
-    u_x = result_col["u_x"]  # ∂u/∂x
-    u_t = result_col["u_t"]  # ∂u/∂t
-    u_xx = result_col["u_xx"]  # ∂²u/∂x²
+    u_col = result_col["u_pred"]
+    u_x = result_col["u_x"]
+    u_t = result_col["u_t"]
+    u_xx = result_col["u_xx"]
 
-    # Burgers residual
     residual = u_t + u_col * u_x - viscosity * u_xx
-    physics_loss = jnp.mean(residual**2)
+    physics_losses = residual**2
 
-    # IC loss (sin(2πx) at t=0) and BC loss (periodic)
     t_ic = jnp.zeros_like(x_ic)
     result_ic = apply_tesseract(
         pinn,
@@ -390,7 +472,7 @@ def compute_loss_components(
     )
     u_ic = result_ic["u_pred"]
     u_ic_true = jnp.sin(2 * jnp.pi * x_ic)
-    ic_loss = jnp.mean((u_ic - u_ic_true) ** 2)
+    ic_losses = (u_ic - u_ic_true) ** 2
 
     x_left = jnp.zeros_like(t_bc)
     x_right = jnp.ones_like(t_bc)
@@ -413,14 +495,68 @@ def compute_loss_components(
     )
     u_left = result_left["u_pred"]
     u_right = result_right["u_pred"]
-    bc_loss = jnp.mean((u_left - u_right) ** 2)
+    bc_losses = (u_left - u_right) ** 2
 
-    total_loss = (
-        weights["data"] * data_loss
-        + weights["physics"] * physics_loss
-        + weights["ic"] * ic_loss
-        + weights["bc"] * bc_loss
+    return {
+        "data": data_losses,
+        "physics": physics_losses,
+        "ic": ic_losses,
+        "bc": bc_losses,
+    }
+
+
+def compute_loss_components(
+    viscosity,
+    params_flat,
+    x_obs,
+    t_obs,
+    u_obs,
+    x_col,
+    t_col,
+    x_ic,
+    t_bc,
+    pinn,
+    brdr_weights=None,
+    loss_weights=None,
+):
+    """Compute total and component PINN losses for the inverse problem.
+
+    Components:
+    1. Data loss: fit observations
+    2. Physics loss: satisfy PDE residual
+    3. Initial condition loss: u(x, 0) = sin(2πx)
+    4. Boundary condition loss: periodic BCs u(0,t) = u(1,t)
+
+    All terms are differentiable with respect to viscosity.
+    """
+    weights = normalize_loss_weights(loss_weights)
+    pointwise_losses = compute_pointwise_losses(
+        viscosity,
+        params_flat,
+        x_obs,
+        t_obs,
+        u_obs,
+        x_col,
+        t_col,
+        x_ic,
+        t_bc,
+        pinn,
     )
+
+    data_loss = jnp.mean(pointwise_losses["data"])
+    physics_loss = jnp.mean(pointwise_losses["physics"])
+    ic_loss = jnp.mean(pointwise_losses["ic"])
+    bc_loss = jnp.mean(pointwise_losses["bc"])
+
+    raw_losses = jnp.asarray([data_loss, physics_loss, ic_loss, bc_loss])
+    if brdr_weights is None:
+        weight_array = loss_weights_to_array(weights)
+        total_loss = jnp.sum(weight_array * raw_losses)
+    else:
+        total_loss = sum(
+            weights[name] * jnp.mean(brdr_weights[name] * pointwise_losses[name])
+            for name in LOSS_WEIGHT_NAMES
+        )
 
     return {
         "total": total_loss,
@@ -442,6 +578,7 @@ def compute_loss(
     x_ic,
     t_bc,
     pinn,
+    brdr_weights=None,
     loss_weights=None,
 ):
     """Compute scalar total PINN loss for gradient-based optimization."""
@@ -456,6 +593,7 @@ def compute_loss(
         x_ic,
         t_bc,
         pinn,
+        brdr_weights=brdr_weights,
         loss_weights=loss_weights,
     )
 
@@ -473,6 +611,7 @@ def compute_loss_from_log_viscosity(
     x_ic,
     t_bc,
     pinn,
+    brdr_weights=None,
     loss_weights=None,
 ):
     """Compute loss while optimizing viscosity in log-space."""
@@ -488,6 +627,7 @@ def compute_loss_from_log_viscosity(
         x_ic,
         t_bc,
         pinn,
+        brdr_weights=brdr_weights,
         loss_weights=loss_weights,
     )
 
@@ -500,6 +640,10 @@ def run_inverse_problem(
     n_obs=None,
     n_epochs=None,
     learning_rate=None,
+    adaptive_loss_weights=None,
+    brdr_beta_c=None,
+    brdr_beta_w=None,
+    brdr_epsilon=None,
     loss_weights=None,
     seed=None,
 ):
@@ -517,6 +661,10 @@ def run_inverse_problem(
         n_obs=n_obs,
         n_epochs=n_epochs,
         learning_rate=learning_rate,
+        adaptive_loss_weights=adaptive_loss_weights,
+        brdr_beta_c=brdr_beta_c,
+        brdr_beta_w=brdr_beta_w,
+        brdr_epsilon=brdr_epsilon,
         loss_weights=loss_weights,
         seed=seed,
     )
@@ -529,6 +677,8 @@ def run_inverse_problem(
 
     if problem.initial_viscosity <= 0:
         raise ValueError("initial_viscosity must be positive when optimizing log_nu")
+    if training.adaptive_loss_weights:
+        validate_brdr_loss_weights(loss_weights)
 
     log_run_header(config)
 
@@ -585,6 +735,11 @@ def run_inverse_problem(
         viscosity_history = [float(viscosity)]
         log_viscosity_history = [float(log_viscosity)]
         loss_history = {name: [] for name in ("total", "data", "physics", "ic", "bc")}
+        brdr_state = None
+        brdr_weights = None
+        loss_weight_history = {
+            name: [loss_weights[name]] for name in LOSS_WEIGHT_NAMES
+        }
 
         with make_training_progress() as progress:
             task_id = progress.add_task(
@@ -599,6 +754,33 @@ def run_inverse_problem(
             for epoch in range(training.n_epochs):
                 start_time = time.time()
 
+                viscosity = jnp.exp(log_viscosity)
+                if training.adaptive_loss_weights:
+                    pointwise_losses = compute_pointwise_losses(
+                        viscosity,
+                        params_flat,
+                        x_obs,
+                        t_obs,
+                        u_obs,
+                        x_col,
+                        t_col,
+                        x_ic,
+                        t_bc,
+                        pinn,
+                    )
+                    if brdr_state is None:
+                        brdr_state = initialize_brdr_state(pointwise_losses)
+                    brdr_state = update_brdr_state(
+                        brdr_state,
+                        pointwise_losses,
+                        beta_c=training.brdr_beta_c,
+                        beta_w=training.brdr_beta_w,
+                        eps=training.brdr_epsilon,
+                    )
+                    brdr_weights = brdr_state["weights"]
+                else:
+                    brdr_weights = None
+
                 # Compute gradients
                 log_v_grad = grad_log_visc(
                     log_viscosity,
@@ -611,9 +793,9 @@ def run_inverse_problem(
                     x_ic,
                     t_bc,
                     pinn,
+                    brdr_weights=brdr_weights,
                     loss_weights=loss_weights,
                 )
-                viscosity = jnp.exp(log_viscosity)
                 p_grad = grad_params(
                     viscosity,
                     params_flat,
@@ -625,6 +807,7 @@ def run_inverse_problem(
                     x_ic,
                     t_bc,
                     pinn,
+                    brdr_weights=brdr_weights,
                     loss_weights=loss_weights,
                 )
 
@@ -644,6 +827,13 @@ def run_inverse_problem(
                 times.append(epoch_time)
                 viscosity_history.append(float(viscosity))
                 log_viscosity_history.append(float(log_viscosity))
+                current_weights = (
+                    loss_weights
+                    if brdr_weights is None
+                    else summarize_brdr_weights(brdr_weights)
+                )
+                for name in LOSS_WEIGHT_NAMES:
+                    loss_weight_history[name].append(current_weights[name])
 
                 loss_value = loss_history["total"][-1] if loss_history["total"] else None
                 if epoch % 20 == 0 or epoch == training.n_epochs - 1:
@@ -658,6 +848,7 @@ def run_inverse_problem(
                         x_ic,
                         t_bc,
                         pinn,
+                        brdr_weights=brdr_weights,
                         loss_weights=loss_weights,
                     )
                     for name, value in loss_components.items():
@@ -687,6 +878,9 @@ def run_inverse_problem(
             relative_error,
             avg_time,
             loss_history,
+            loss_weight_history=loss_weight_history
+            if training.adaptive_loss_weights
+            else None,
         )
 
     return {
@@ -699,6 +893,9 @@ def run_inverse_problem(
         "log_viscosity_history": log_viscosity_history,
         "loss_history": loss_history,
         "loss_weights": loss_weights,
+        "loss_weight_history": loss_weight_history,
+        "brdr_state": brdr_state,
+        "adaptive_loss_weights": training.adaptive_loss_weights,
         "seed": data_config.seed,
         "config": config,
     }
@@ -708,6 +905,10 @@ def compare_backends(
     config=None,
     n_epochs=None,
     n_obs=None,
+    adaptive_loss_weights=None,
+    brdr_beta_c=None,
+    brdr_beta_w=None,
+    brdr_epsilon=None,
     loss_weights=None,
     seed=None,
 ):
@@ -716,6 +917,10 @@ def compare_backends(
         config,
         n_epochs=n_epochs,
         n_obs=n_obs,
+        adaptive_loss_weights=adaptive_loss_weights,
+        brdr_beta_c=brdr_beta_c,
+        brdr_beta_w=brdr_beta_w,
+        brdr_epsilon=brdr_epsilon,
         loss_weights=loss_weights,
         seed=seed,
     )
@@ -757,6 +962,10 @@ def compare_backends(
 def run_single_backend(
     backend=None,
     n_epochs=None,
+    adaptive_loss_weights=None,
+    brdr_beta_c=None,
+    brdr_beta_w=None,
+    brdr_epsilon=None,
     loss_weights=None,
     seed=None,
     config=None,
@@ -768,6 +977,10 @@ def run_single_backend(
         config=config,
         backend=backend,
         n_epochs=n_epochs,
+        adaptive_loss_weights=adaptive_loss_weights,
+        brdr_beta_c=brdr_beta_c,
+        brdr_beta_w=brdr_beta_w,
+        brdr_epsilon=brdr_epsilon,
         loss_weights=loss_weights,
         seed=seed,
     )
@@ -777,11 +990,23 @@ def run_seed_sweep(
     backend="jax",
     seeds=(123,),
     n_epochs=None,
+    adaptive_loss_weights=None,
+    brdr_beta_c=None,
+    brdr_beta_w=None,
+    brdr_epsilon=None,
     loss_weights=None,
     config=None,
 ):
     """Run one backend or both backends across multiple random seeds."""
-    config = build_run_config(config, n_epochs=n_epochs, loss_weights=loss_weights)
+    config = build_run_config(
+        config,
+        n_epochs=n_epochs,
+        adaptive_loss_weights=adaptive_loss_weights,
+        brdr_beta_c=brdr_beta_c,
+        brdr_beta_w=brdr_beta_w,
+        brdr_epsilon=brdr_epsilon,
+        loss_weights=loss_weights,
+    )
     results = []
 
     for seed in seeds:
@@ -827,6 +1052,29 @@ if __name__ == "__main__":
         help="Run a seed sweep with one or more random seeds",
     )
     parser.add_argument(
+        "--adaptive-loss-weights",
+        action="store_true",
+        help="Use BRDR pointwise adaptive weights for data/physics/IC/BC residuals",
+    )
+    parser.add_argument(
+        "--brdr-beta-c",
+        type=float,
+        default=RunConfig().training.brdr_beta_c,
+        help="EMA factor for BRDR residual-history estimates",
+    )
+    parser.add_argument(
+        "--brdr-beta-w",
+        type=float,
+        default=RunConfig().training.brdr_beta_w,
+        help="EMA factor for BRDR pointwise weights",
+    )
+    parser.add_argument(
+        "--brdr-epsilon",
+        type=float,
+        default=RunConfig().training.brdr_epsilon,
+        help="Small positive constant for BRDR numerical stability",
+    )
+    parser.add_argument(
         "--w-data",
         type=float,
         default=DEFAULT_LOSS_WEIGHTS["data"],
@@ -868,6 +1116,10 @@ if __name__ == "__main__":
         backend=args.backend,
         n_epochs=args.epochs,
         seed=args.seed,
+        adaptive_loss_weights=args.adaptive_loss_weights,
+        brdr_beta_c=args.brdr_beta_c,
+        brdr_beta_w=args.brdr_beta_w,
+        brdr_epsilon=args.brdr_epsilon,
         loss_weights=loss_weights,
     )
 

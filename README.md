@@ -199,6 +199,10 @@ uv run python inverse_problem.py --backend jax --epochs 50 --seed 123
 uv run python inverse_problem.py --backend jax --epochs 50 \
   --w-data 1.0 --w-physics 0.2 --w-ic 0.5 --w-bc 0.5
 
+# Use BRDR pointwise adaptive loss weights
+uv run python inverse_problem.py --backend jax --epochs 100 \
+  --adaptive-loss-weights
+
 # Seed sweep with summary statistics
 uv run python inverse_problem.py --backend jax --epochs 50 --seeds 0 1 2 3 4
 ```
@@ -212,10 +216,11 @@ uv run streamlit run app.py
 The Streamlit app provides:
 - Adjustable hyperparameters (viscosity, noise, learning rate)
 - Real-time training visualization
+- Optional BRDR adaptive loss weighting and component mean-weight plots
 - Gradient flow inspector (Tesseract API call statistics)
 - Solution comparison plots
 
-The CLI is the reference path for the current solver-backed observations, dataclass configs, seeded runs, and `log_nu` optimization. The Streamlit app still needs a cleanup pass to remove older analytical-reference labels and fully match the CLI pipeline.
+The CLI is the reference path for dataclass configs and seeded runs. The Streamlit app follows the same solver-backed observation generation, `log_nu` optimization, and optional adaptive loss-weighting path for interactive runs.
 
 ### Tests
 
@@ -261,8 +266,9 @@ Regenerate these figures before treating them as benchmark results for the lates
 
 - The CLI inverse pipeline uses solver-generated noisy Burgers observations.
 - The solver generates observations offline for training. End-to-end differentiation through the solver during inverse training remains future work.
+- Loss weights can be fixed manually or adapted with opt-in BRDR pointwise residual weighting.
 - The PINN backend can be JAX or PyTorch; Tesseract exposes both through the same `apply`/VJP/JVP interface.
-- The Streamlit app is useful for interactive inspection, but it has not yet been fully aligned with the latest CLI refactor.
+- The Streamlit app is aligned with the current solver-backed training path for interactive inspection.
 
 ## References
 

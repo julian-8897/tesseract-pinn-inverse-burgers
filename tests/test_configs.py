@@ -19,6 +19,10 @@ def test_build_run_config_applies_legacy_overrides():
         n_epochs=7,
         learning_rate=0.2,
         param_learning_rate=2e-3,
+        adaptive_loss_weights=True,
+        brdr_beta_c=0.99,
+        brdr_beta_w=0.98,
+        brdr_epsilon=1e-10,
         loss_weights={"physics": 0.25},
         seed=9,
         noise_std=0.01,
@@ -36,6 +40,10 @@ def test_build_run_config_applies_legacy_overrides():
     assert config.training.n_epochs == 7
     assert config.training.log_nu_learning_rate == 0.2
     assert config.training.param_learning_rate == 2e-3
+    assert config.training.adaptive_loss_weights is True
+    assert config.training.brdr_beta_c == 0.99
+    assert config.training.brdr_beta_w == 0.98
+    assert config.training.brdr_epsilon == 1e-10
     assert config.training.n_col == 16
     assert config.training.n_ic == 8
     assert config.training.n_bc == 6

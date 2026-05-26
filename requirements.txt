@@ -1,3 +1,14 @@
-tesseract-core==1.2.0
-tesseract-jax==0.2.2
-jax[cpu]==0.8.1
+diffrax>=0.7.0
+equinox>=0.13.2
+jax[cpu]>=0.8.2
+matplotlib>=3.7.0
+numpy>=1.24.0
+optax>=0.2.6
+pydantic>=2.12.5
+rich>=14.2.0
+seaborn>=0.13.2
+streamlit>=1.32.0
+tesseract-core[runtime]>=1.2.0
+tesseract-jax>=0.2.3
+torch>=2.9.1
+torchvision>=0.24.1

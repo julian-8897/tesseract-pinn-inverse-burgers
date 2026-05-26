@@ -37,6 +37,10 @@ class TrainingConfig:
     n_epochs: int = 50
     log_nu_learning_rate: float = 0.1
     param_learning_rate: float = 1e-3
+    adaptive_loss_weights: bool = False
+    brdr_beta_c: float = 0.9999
+    brdr_beta_w: float = 0.999
+    brdr_epsilon: float = 1e-12
     n_col: int = 200
     n_ic: int = 50
     n_bc: int = 50

@@ -17,6 +17,7 @@ dependencies = [
     "optax>=0.2.6",
     "pydantic>=2.12.5",
     "rich>=14.2.0",
+    "seaborn>=0.13.2",
     "streamlit>=1.32.0",
     "tesseract-core[runtime]>=1.2.0",
     "tesseract-jax>=0.2.3",
