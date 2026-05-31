@@ -16,6 +16,17 @@ from pydantic import BaseModel, Field
 from tesseract_core.runtime import Array, Differentiable, Float32
 
 
+FOURIER_FEATURE_SEED = 0
+
+
+def fixed_fourier_features(n_fourier_features=32):
+    """Return backend-independent fixed Fourier frequencies."""
+    rng = np.random.default_rng(FOURIER_FEATURE_SEED)
+    b_x = rng.normal(size=n_fourier_features).astype(np.float32) * 2.0
+    b_t = rng.normal(size=n_fourier_features).astype(np.float32) * 2.0
+    return torch.from_numpy(b_x), torch.from_numpy(b_t)
+
+
 class InputSchema(BaseModel):
     """Input schema for PINN."""
 
@@ -51,13 +62,14 @@ class PINNNet(nn.Module):
     """Simple MLP for PINN with Fourier feature encoding (PyTorch)."""
 
     def __init__(self, hidden_sizes=[64, 64, 64], n_fourier_features=32, seed=0):
-        """Initialize network with Fourier features for better convergence."""
+        """Initialize trainable MLP with fixed Fourier features."""
         super().__init__()
 
         torch.manual_seed(seed)
 
-        self.register_buffer("B_x", torch.randn(n_fourier_features) * 2.0)
-        self.register_buffer("B_t", torch.randn(n_fourier_features) * 2.0)
+        b_x, b_t = fixed_fourier_features(n_fourier_features)
+        self.register_buffer("B_x", b_x)
+        self.register_buffer("B_t", b_t)
 
         # Input: 2*n_fourier_features (sin + cos for x and t) + 2 (raw x, t)
         input_dim = 4 * n_fourier_features + 2
@@ -98,13 +110,14 @@ class PINNNet(nn.Module):
 
 
 def flatten_params(model):
-    """Flatten model parameters to a single numpy array."""
+    """Flatten trainable MLP parameters to a single numpy array.
+
+    Fourier feature frequencies are fixed backend-independent buffers, not
+    trainable parameters.
+    """
     params = []
     for p in model.parameters():
         params.append(p.detach().cpu().numpy().flatten())
-    # Include buffers (B_x, B_t)
-    for b in model.buffers():
-        params.append(b.detach().cpu().numpy().flatten())
     return np.concatenate(params).astype(np.float32)
 
 
@@ -125,14 +138,6 @@ def unflatten_params(params_flat, reference_model=None):
         size = param.numel()
         state_dict[name] = torch.tensor(
             params_flat[start : start + size].reshape(param.shape), dtype=torch.float32
-        )
-        start += size
-
-    # Load buffers (B_x, B_t)
-    for name, buf in model.named_buffers():
-        size = buf.numel()
-        state_dict[name] = torch.tensor(
-            params_flat[start : start + size].reshape(buf.shape), dtype=torch.float32
         )
         start += size
 
@@ -278,9 +283,6 @@ def vector_jacobian_product(
                 grads.append(p.grad.detach().cpu().numpy().flatten())
             else:
                 grads.append(np.zeros(p.numel()))
-        # Buffers don't have gradients
-        for b in model.buffers():
-            grads.append(np.zeros(b.numel()))
         result["params_flat"] = np.concatenate(grads).astype(np.float32)
 
     return result
@@ -295,8 +297,25 @@ def jacobian_vector_product(
     """
     Compute JVP (forward-mode AD) for Tesseract autodiff.
 
-    Uses torch.autograd.functional.jvp
+    Scope: this backend's forward-mode path covers ``u_pred`` with respect to
+    the ``x`` and ``t`` tangents only. The inverse-training demo uses reverse
+    mode (``vector_jacobian_product``), so the derivative outputs and parameter
+    tangents are intentionally not implemented here. Unsupported requests raise
+    rather than silently returning a partial result. The JAX backend exposes the
+    full JVP if forward-mode over all outputs is required.
     """
+    unsupported_outputs = set(jvp_outputs) - {"u_pred"}
+    if unsupported_outputs:
+        raise NotImplementedError(
+            "PyTorch JVP only supports the 'u_pred' output; requested "
+            f"{sorted(jvp_outputs)}. Use the JAX backend for full forward-mode AD."
+        )
+    if "params_flat" in jvp_inputs:
+        raise NotImplementedError(
+            "PyTorch JVP does not support 'params_flat' tangents; "
+            "use vector_jacobian_product for parameter gradients."
+        )
+
     x = np.array(inputs.x)
     t = np.array(inputs.t)
     params_flat = np.array(inputs.params_flat)

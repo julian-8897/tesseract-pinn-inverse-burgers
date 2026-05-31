@@ -7,6 +7,22 @@ from dataclasses import dataclass, field, replace
 from math import isfinite
 
 
+def _check_positive(name, value):
+    value = float(value)
+    if not isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def _check_unit_interval(name, value):
+    value = float(value)
+    if not (0.0 < value < 1.0):
+        raise ValueError(f"{name} must lie in the open interval (0, 1)")
+    return value
+
+
 @dataclass(frozen=True)
 class ProblemConfig:
     """Physical inverse-problem setup."""
@@ -15,6 +31,16 @@ class ProblemConfig:
     initial_viscosity: float = 0.01
     domain_x: tuple[float, float] = (0.0, 1.0)
     domain_t: tuple[float, float] = (0.0, 1.0)
+
+    def __post_init__(self):
+        _check_positive("true_viscosity", self.true_viscosity)
+        _check_positive("initial_viscosity", self.initial_viscosity)
+        for name, bounds in (("domain_x", self.domain_x), ("domain_t", self.domain_t)):
+            lo, hi = float(bounds[0]), float(bounds[1])
+            if not (isfinite(lo) and isfinite(hi)):
+                raise ValueError(f"{name} bounds must be finite")
+            if lo >= hi:
+                raise ValueError(f"{name} lower bound must be less than upper bound")
 
     @property
     def domain(self):
@@ -28,6 +54,14 @@ class DataConfig:
     n_obs: int = 80
     noise_std: float = 0.02
     seed: int = 123
+
+    def __post_init__(self):
+        if int(self.n_obs) <= 0:
+            raise ValueError("n_obs must be a positive integer")
+        if float(self.noise_std) < 0 or not isfinite(float(self.noise_std)):
+            raise ValueError("noise_std must be a finite non-negative value")
+        if int(self.seed) < 0:
+            raise ValueError("seed must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -44,6 +78,29 @@ class TrainingConfig:
     n_col: int = 200
     n_ic: int = 50
     n_bc: int = 50
+    viscosity_warmup_epochs: int = 0
+    clip_log_viscosity: bool = False
+    nu_clip_min: float = 1e-4
+    nu_clip_max: float = 0.5
+
+    def __post_init__(self):
+        if int(self.n_epochs) <= 0:
+            raise ValueError("n_epochs must be a positive integer")
+        _check_positive("log_nu_learning_rate", self.log_nu_learning_rate)
+        _check_positive("param_learning_rate", self.param_learning_rate)
+        _check_unit_interval("brdr_beta_c", self.brdr_beta_c)
+        _check_unit_interval("brdr_beta_w", self.brdr_beta_w)
+        _check_positive("brdr_epsilon", self.brdr_epsilon)
+        for name in ("n_col", "n_ic", "n_bc"):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if int(self.viscosity_warmup_epochs) < 0:
+            raise ValueError("viscosity_warmup_epochs must be non-negative")
+        if self.clip_log_viscosity:
+            lo = _check_positive("nu_clip_min", self.nu_clip_min)
+            hi = _check_positive("nu_clip_max", self.nu_clip_max)
+            if lo >= hi:
+                raise ValueError("nu_clip_min must be less than nu_clip_max")
 
 
 @dataclass(frozen=True)

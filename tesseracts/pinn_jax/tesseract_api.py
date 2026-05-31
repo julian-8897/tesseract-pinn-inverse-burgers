@@ -12,9 +12,21 @@ from typing import Any
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from pydantic import BaseModel, Field
 from tesseract_core.runtime import Array, Differentiable, Float32
 from tesseract_core.runtime.tree_transforms import filter_func, flatten_with_paths
+
+
+FOURIER_FEATURE_SEED = 0
+
+
+def fixed_fourier_features(n_fourier_features=32):
+    """Return backend-independent fixed Fourier frequencies."""
+    rng = np.random.default_rng(FOURIER_FEATURE_SEED)
+    b_x = rng.normal(size=n_fourier_features).astype(np.float32) * 2.0
+    b_t = rng.normal(size=n_fourier_features).astype(np.float32) * 2.0
+    return jnp.asarray(b_x), jnp.asarray(b_t)
 
 
 class InputSchema(BaseModel):
@@ -57,17 +69,16 @@ class PINNNet(eqx.Module):
     B_t: jax.Array
 
     def __init__(self, key, hidden_sizes=[64, 64, 64], n_fourier_features=32):
-        """Initialize network with Fourier features for better convergence."""
-        keys = jax.random.split(key, 4)
+        """Initialize trainable MLP with fixed Fourier features."""
 
-        # Fourier feature matrices
-        self.B_x = jax.random.normal(keys[0], (n_fourier_features,)) * 2.0
-        self.B_t = jax.random.normal(keys[1], (n_fourier_features,)) * 2.0
+        # Fixed Fourier feature frequencies keep the trainable parameter contract
+        # identical across the JAX and PyTorch backends.
+        self.B_x, self.B_t = fixed_fourier_features(n_fourier_features)
 
         # Input: 2*n_fourier_features (sin + cos for x and t) + 2 (raw x, t)
         input_dim = 4 * n_fourier_features + 2
         layer_sizes = [input_dim] + hidden_sizes + [1]
-        layer_keys = jax.random.split(keys[2], len(layer_sizes) - 1)
+        layer_keys = jax.random.split(key, len(layer_sizes) - 1)
 
         self.layers = []
         for i, (in_size, out_size) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:])):
@@ -99,8 +110,12 @@ class PINNNet(eqx.Module):
 
 
 def flatten_params(model):
-    """Flatten model parameters to a single array."""
-    leaves, _ = jax.tree_util.tree_flatten(eqx.filter(model, eqx.is_array))
+    """Flatten trainable MLP parameters to a single array.
+
+    Fourier feature frequencies are fixed backend-independent constants, not
+    trainable parameters.
+    """
+    leaves, _ = jax.tree_util.tree_flatten(eqx.filter(model.layers, eqx.is_array))
     return jnp.concatenate([leaf.flatten() for leaf in leaves])
 
 
@@ -110,9 +125,13 @@ def unflatten_params(params_flat, reference_key=None):
         reference_key = jax.random.PRNGKey(0)
     reference_model = PINNNet(reference_key)
 
-    leaves, treedef = jax.tree_util.tree_flatten(
-        eqx.filter(reference_model, eqx.is_array)
+    trainable_layers = eqx.filter(reference_model.layers, eqx.is_array)
+    static_layers = eqx.filter(
+        reference_model.layers,
+        eqx.is_inexact_array,
+        inverse=True,
     )
+    leaves, treedef = jax.tree_util.tree_flatten(trainable_layers)
     shapes = [leaf.shape for leaf in leaves]
     sizes = [leaf.size for leaf in leaves]
 
@@ -123,10 +142,9 @@ def unflatten_params(params_flat, reference_key=None):
         start += size
 
     params_tree = jax.tree_util.tree_unflatten(treedef, unflattened_leaves)
+    layers = eqx.combine(params_tree, static_layers)
 
-    return eqx.combine(
-        params_tree, eqx.filter(reference_model, eqx.is_inexact_array, inverse=True)
-    )
+    return eqx.tree_at(lambda model: model.layers, reference_model, layers)
 
 
 @eqx.filter_jit

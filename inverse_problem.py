@@ -11,7 +11,8 @@ in Burgers equation: ∂u/∂t + u·∂u/∂x = ν·∂²u/∂x²
 
 import sys
 import time
-from dataclasses import replace
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import fmean, pstdev
 
@@ -632,6 +633,491 @@ def compute_loss_from_log_viscosity(
     )
 
 
+#
+# Shared training engine
+#
+# A single `train_inverse` loop powers both the CLI (`inverse_problem.py`) and
+# the Streamlit app (`app.py`). Presentation lives in callbacks so neither
+# frontend reimplements the optimization.
+#
+
+
+class TesseractCallCounter:
+    """Counts real Tesseract container apply/VJP/JVP dispatches."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.apply_calls = 0
+        self.vjp_calls = 0
+        self.jvp_calls = 0
+
+
+@contextmanager
+def count_tesseract_calls(counter):
+    """Instrument actual container round-trips by wrapping the dispatch layer.
+
+    `tesseract_jax` routes every container call through `Jaxeract.apply`,
+    `.vector_jacobian_product`, and `.jacobian_vector_product`. Wrapping these
+    yields measured call counts instead of hardcoded estimates.
+    """
+    from tesseract_jax.tesseract_compat import Jaxeract
+
+    orig_apply = Jaxeract.apply
+    orig_vjp = Jaxeract.vector_jacobian_product
+    orig_jvp = Jaxeract.jacobian_vector_product
+
+    def apply(self, *args, **kwargs):
+        counter.apply_calls += 1
+        return orig_apply(self, *args, **kwargs)
+
+    def vjp(self, *args, **kwargs):
+        counter.vjp_calls += 1
+        return orig_vjp(self, *args, **kwargs)
+
+    def jvp(self, *args, **kwargs):
+        counter.jvp_calls += 1
+        return orig_jvp(self, *args, **kwargs)
+
+    Jaxeract.apply = apply
+    Jaxeract.vector_jacobian_product = vjp
+    Jaxeract.jacobian_vector_product = jvp
+    try:
+        yield counter
+    finally:
+        Jaxeract.apply = orig_apply
+        Jaxeract.vector_jacobian_product = orig_vjp
+        Jaxeract.jacobian_vector_product = orig_jvp
+
+
+@dataclass
+class EpochRecord:
+    """Per-epoch training state passed to callbacks."""
+
+    epoch: int
+    n_epochs: int
+    viscosity: float
+    log_viscosity: float
+    loss: float
+    visc_grad_norm: float
+    param_grad_norm: float
+    epoch_time: float
+    apply_calls: int
+    vjp_calls: int
+    effective_weights: dict
+    viscosity_updated: bool
+    param_count: int
+    brdr_weights: dict | None = None
+    loss_components: dict | None = None
+
+
+class TrainingCallback:
+    """No-op base callback. Frontends override the hooks they need."""
+
+    def on_start(self, context):
+        pass
+
+    def on_epoch(self, record):
+        pass
+
+    def on_finish(self, result):
+        pass
+
+
+def image_name_for_backend(backend):
+    """Map a backend name to its Tesseract image."""
+    return "pinn_jax" if backend == "jax" else "pinn_pytorch"
+
+
+def docker_image_available(image_name):
+    """Return whether a local Tesseract Docker image exists."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", image_name, "--type", "image"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+class TesseractImageNotFoundError(RuntimeError):
+    """Raised when a required Tesseract container image is not built locally."""
+
+
+def ensure_image_available(image_name):
+    """Fail early with an actionable message if the container image is missing."""
+    if not docker_image_available(image_name):
+        raise TesseractImageNotFoundError(
+            f"Tesseract image '{image_name}' was not found. "
+            "Build the containers first with ./buildall.sh (Docker required)."
+        )
+
+
+def build_training_inputs(config):
+    """Sample solver-backed observations and collocation/IC/BC points.
+
+    Shared by the CLI and the app so both consume identical, seed-reproducible
+    inputs.
+    """
+    problem = config.problem
+    data_config = config.data
+    training = config.training
+    domain = problem.domain
+
+    key = jax.random.PRNGKey(data_config.seed)
+    key_obs, key_col_x, key_col_t, key_ic, key_bc = jax.random.split(key, 5)
+
+    x_obs, t_obs, u_obs = generate_observations(
+        data_config.n_obs,
+        problem.true_viscosity,
+        domain,
+        key_obs,
+        noise_std=data_config.noise_std,
+    )
+    x_col = jax.random.uniform(
+        key_col_x, (training.n_col,), minval=domain["x"][0], maxval=domain["x"][1]
+    )
+    t_col = jax.random.uniform(
+        key_col_t, (training.n_col,), minval=0.05, maxval=domain["t"][1]
+    )
+    x_ic = jax.random.uniform(
+        key_ic, (training.n_ic,), minval=domain["x"][0], maxval=domain["x"][1]
+    )
+    t_bc = jax.random.uniform(
+        key_bc, (training.n_bc,), minval=0.05, maxval=domain["t"][1]
+    )
+    return x_obs, t_obs, u_obs, x_col, t_col, x_ic, t_bc
+
+
+def _loss_from_log_and_params(
+    log_viscosity,
+    params_flat,
+    x_obs,
+    t_obs,
+    u_obs,
+    x_col,
+    t_col,
+    x_ic,
+    t_bc,
+    pinn,
+    brdr_weights,
+    loss_weights,
+):
+    """Scalar loss as a function of both optimized variables for value_and_grad."""
+    return compute_loss(
+        jnp.exp(log_viscosity),
+        params_flat,
+        x_obs,
+        t_obs,
+        u_obs,
+        x_col,
+        t_col,
+        x_ic,
+        t_bc,
+        pinn,
+        brdr_weights=brdr_weights,
+        loss_weights=loss_weights,
+    )
+
+
+def train_inverse(config, *, pinn=None, callback=None, metrics_every=20):
+    """Run the inverse-viscosity optimization loop.
+
+    A single reverse-mode `value_and_grad` over both ``log_nu`` and the PINN
+    parameters replaces the previous two separate `jax.grad` passes plus a
+    standalone loss evaluation, cutting Tesseract round-trips per step from three
+    forward/backward sweeps to one. Presentation is delegated to ``callback``.
+
+    Args:
+        config: a validated ``RunConfig``.
+        pinn: an already-open Tesseract. If ``None``, one is created from the
+            backend image and managed for the duration of the call.
+        callback: optional ``TrainingCallback`` for progress/visualization.
+        metrics_every: cadence (in epochs) for computing full loss components.
+    """
+    backend = config.backend
+    problem = config.problem
+    data_config = config.data
+    training = config.training
+    loss_weights = config.loss.as_dict()
+
+    if training.adaptive_loss_weights:
+        validate_brdr_loss_weights(loss_weights)
+
+    callback = callback or TrainingCallback()
+    counter = TesseractCallCounter()
+
+    x_obs, t_obs, u_obs, x_col, t_col, x_ic, t_bc = build_training_inputs(config)
+
+    image_name = image_name_for_backend(backend)
+    owns_pinn = pinn is None
+    if owns_pinn:
+        pinn = Tesseract.from_image(image_name)
+
+    params_flat = get_initial_params(backend, seed=data_config.seed)
+
+    log_viscosity = jnp.log(jnp.asarray(problem.initial_viscosity))
+    log_nu_bounds = None
+    if training.clip_log_viscosity:
+        log_nu_bounds = (
+            jnp.log(jnp.asarray(training.nu_clip_min, dtype=jnp.float32)),
+            jnp.log(jnp.asarray(training.nu_clip_max, dtype=jnp.float32)),
+        )
+    warmup_epochs = min(
+        training.viscosity_warmup_epochs, max(0, training.n_epochs - 1)
+    )
+
+    log_visc_optimizer = optax.adam(training.log_nu_learning_rate)
+    log_visc_opt_state = log_visc_optimizer.init(log_viscosity)
+    param_optimizer = optax.adam(training.param_learning_rate)
+    param_opt_state = param_optimizer.init(params_flat)
+
+    loss_and_grads = jax.value_and_grad(_loss_from_log_and_params, argnums=(0, 1))
+
+    viscosity = jnp.exp(log_viscosity)
+    times = []
+    viscosity_history = [float(viscosity)]
+    log_viscosity_history = [float(log_viscosity)]
+    loss_history = {name: [] for name in ("total", "data", "physics", "ic", "bc")}
+    loss_weight_history = {name: [loss_weights[name]] for name in LOSS_WEIGHT_NAMES}
+    brdr_state = None
+
+    def _run():
+        nonlocal log_viscosity, params_flat, viscosity
+        nonlocal log_visc_opt_state, param_opt_state, brdr_state
+
+        callback.on_start(
+            {
+                "config": config,
+                "backend": backend,
+                "image_name": image_name,
+                "warmup_epochs": warmup_epochs,
+                "x_obs": x_obs,
+                "t_obs": t_obs,
+                "u_obs": u_obs,
+            }
+        )
+
+        for epoch in range(training.n_epochs):
+            start_time = time.time()
+            viscosity = jnp.exp(log_viscosity)
+
+            brdr_weights = None
+            if training.adaptive_loss_weights:
+                pointwise_losses = compute_pointwise_losses(
+                    viscosity,
+                    params_flat,
+                    x_obs,
+                    t_obs,
+                    u_obs,
+                    x_col,
+                    t_col,
+                    x_ic,
+                    t_bc,
+                    pinn,
+                )
+                if brdr_state is None:
+                    brdr_state = initialize_brdr_state(pointwise_losses)
+                brdr_state = update_brdr_state(
+                    brdr_state,
+                    pointwise_losses,
+                    beta_c=training.brdr_beta_c,
+                    beta_w=training.brdr_beta_w,
+                    eps=training.brdr_epsilon,
+                )
+                brdr_weights = brdr_state["weights"]
+
+            # One reverse-mode sweep yields the loss and both gradients.
+            counter.reset()
+            with count_tesseract_calls(counter):
+                loss, (log_v_grad, p_grad) = loss_and_grads(
+                    log_viscosity,
+                    params_flat,
+                    x_obs,
+                    t_obs,
+                    u_obs,
+                    x_col,
+                    t_col,
+                    x_ic,
+                    t_bc,
+                    pinn,
+                    brdr_weights,
+                    loss_weights,
+                )
+            apply_calls = counter.apply_calls
+            vjp_calls = counter.vjp_calls
+
+            visc_grad_norm = float(jnp.abs(log_v_grad))
+            param_grad_norm = float(jnp.linalg.norm(p_grad))
+
+            viscosity_updated = epoch >= warmup_epochs
+            if viscosity_updated:
+                log_visc_updates, log_visc_opt_state = log_visc_optimizer.update(
+                    log_v_grad, log_visc_opt_state
+                )
+                log_viscosity = optax.apply_updates(log_viscosity, log_visc_updates)
+                if log_nu_bounds is not None:
+                    log_viscosity = jnp.clip(
+                        log_viscosity, log_nu_bounds[0], log_nu_bounds[1]
+                    )
+
+            param_updates, param_opt_state = param_optimizer.update(
+                p_grad, param_opt_state
+            )
+            params_flat = optax.apply_updates(params_flat, param_updates)
+            viscosity = jnp.exp(log_viscosity)
+
+            epoch_time = time.time() - start_time
+            times.append(epoch_time)
+            viscosity_history.append(float(viscosity))
+            log_viscosity_history.append(float(log_viscosity))
+
+            effective_weights = (
+                dict(loss_weights)
+                if brdr_weights is None
+                else summarize_brdr_weights(brdr_weights)
+            )
+            for name in LOSS_WEIGHT_NAMES:
+                loss_weight_history[name].append(effective_weights[name])
+
+            loss_components = None
+            if epoch % metrics_every == 0 or epoch == training.n_epochs - 1:
+                loss_components = {
+                    name: float(value)
+                    for name, value in compute_loss_components(
+                        viscosity,
+                        params_flat,
+                        x_obs,
+                        t_obs,
+                        u_obs,
+                        x_col,
+                        t_col,
+                        x_ic,
+                        t_bc,
+                        pinn,
+                        brdr_weights=brdr_weights,
+                        loss_weights=loss_weights,
+                    ).items()
+                }
+                for name, value in loss_components.items():
+                    loss_history[name].append(value)
+
+            callback.on_epoch(
+                EpochRecord(
+                    epoch=epoch,
+                    n_epochs=training.n_epochs,
+                    viscosity=float(viscosity),
+                    log_viscosity=float(log_viscosity),
+                    loss=float(loss),
+                    visc_grad_norm=visc_grad_norm,
+                    param_grad_norm=param_grad_norm,
+                    epoch_time=epoch_time,
+                    apply_calls=apply_calls,
+                    vjp_calls=vjp_calls,
+                    effective_weights=effective_weights,
+                    viscosity_updated=viscosity_updated,
+                    param_count=int(params_flat.size),
+                    brdr_weights=brdr_weights,
+                    loss_components=loss_components,
+                )
+            )
+
+    if owns_pinn:
+        with pinn:
+            _run()
+    else:
+        _run()
+
+    final_viscosity = float(viscosity)
+    relative_error = (
+        abs(final_viscosity - problem.true_viscosity) / problem.true_viscosity * 100
+    )
+    avg_time = sum(times) / len(times) * 1000 if times else 0.0
+
+    result = {
+        "backend": backend,
+        "tesseract_image": image_name,
+        "final_viscosity": final_viscosity,
+        "true_viscosity": problem.true_viscosity,
+        "relative_error": relative_error,
+        "avg_time_ms": avg_time,
+        "viscosity_history": viscosity_history,
+        "log_viscosity_history": log_viscosity_history,
+        "loss_history": loss_history,
+        "loss_weights": loss_weights,
+        "loss_weight_history": loss_weight_history,
+        "brdr_state": brdr_state,
+        "adaptive_loss_weights": training.adaptive_loss_weights,
+        "seed": data_config.seed,
+        "config": config,
+        "params_flat": params_flat,
+        "warmup_epochs": warmup_epochs,
+        "observations": (x_obs, t_obs, u_obs),
+        "pinn": pinn,
+    }
+    callback.on_finish(result)
+    return result
+
+
+class RichProgressCallback(TrainingCallback):
+    """CLI presentation: a live rich progress bar plus a final results table."""
+
+    def __init__(self, config):
+        self.config = config
+        self.true_viscosity = config.problem.true_viscosity
+        self.progress = make_training_progress()
+        self.task_id = None
+        self._last_loss = None
+
+    def on_start(self, context):
+        initial = float(self.config.problem.initial_viscosity)
+        CONSOLE.log(f"{context['backend'].upper()} PINN tesseract initialized")
+        CONSOLE.log("Optimizing...")
+        self.progress.start()
+        self.task_id = self.progress.add_task(
+            f"{context['backend'].upper()} training",
+            total=self.config.training.n_epochs,
+            loss="pending",
+            nu=f"{initial:.6f}",
+            error=f"{abs(initial - self.true_viscosity):.6f}",
+            epoch_time="pending",
+        )
+
+    def on_epoch(self, record):
+        if record.loss_components is not None:
+            self._last_loss = record.loss_components["total"]
+        loss_text = (
+            f"{self._last_loss:.3e}" if self._last_loss is not None else "pending"
+        )
+        self.progress.update(
+            self.task_id,
+            advance=1,
+            loss=loss_text,
+            nu=f"{record.viscosity:.6f}",
+            error=f"{abs(record.viscosity - self.true_viscosity):.6f}",
+            epoch_time=f"{record.epoch_time * 1000:.0f}ms",
+        )
+
+    def on_finish(self, result):
+        self.progress.stop()
+        log_final_results(
+            result["final_viscosity"],
+            result["true_viscosity"],
+            result["relative_error"],
+            result["avg_time_ms"],
+            result["loss_history"],
+            loss_weight_history=result["loss_weight_history"]
+            if result["adaptive_loss_weights"]
+            else None,
+        )
+
+
 def run_inverse_problem(
     config=None,
     backend=None,
@@ -668,237 +1154,16 @@ def run_inverse_problem(
         loss_weights=loss_weights,
         seed=seed,
     )
-    backend = config.backend
-    problem = config.problem
-    data_config = config.data
-    training = config.training
-    loss_weights = config.loss.as_dict()
-    domain = problem.domain
 
-    if problem.initial_viscosity <= 0:
+    if config.problem.initial_viscosity <= 0:
         raise ValueError("initial_viscosity must be positive when optimizing log_nu")
-    if training.adaptive_loss_weights:
-        validate_brdr_loss_weights(loss_weights)
 
+    ensure_image_available(image_name_for_backend(config.backend))
     log_run_header(config)
 
-    # Make observations and collocation points
-    key = jax.random.PRNGKey(data_config.seed)
-    key_obs, key_col_x, key_col_t, key_ic, key_bc = jax.random.split(key, 5)
-    x_obs, t_obs, u_obs = generate_observations(
-        data_config.n_obs,
-        problem.true_viscosity,
-        domain,
-        key_obs,
-        noise_std=data_config.noise_std,
-    )
-    x_col = jax.random.uniform(
-        key_col_x, (training.n_col,), minval=domain["x"][0], maxval=domain["x"][1]
-    )
-    t_col = jax.random.uniform(
-        key_col_t, (training.n_col,), minval=0.05, maxval=domain["t"][1]
-    )
-
-    x_ic = jax.random.uniform(
-        key_ic, (training.n_ic,), minval=domain["x"][0], maxval=domain["x"][1]
-    )
-
-    t_bc = jax.random.uniform(
-        key_bc, (training.n_bc,), minval=0.05, maxval=domain["t"][1]
-    )
-
-    image_name = "pinn_jax" if backend == "jax" else "pinn_pytorch"
-    pinn = Tesseract.from_image(image_name)
-
-    params_flat = get_initial_params(backend, seed=data_config.seed)
-    CONSOLE.log(f"Model parameters: {params_flat.size}")
-
-    log_viscosity = jnp.log(jnp.asarray(problem.initial_viscosity))
-    viscosity = jnp.exp(log_viscosity)
-
-    log_visc_optimizer = optax.adam(training.log_nu_learning_rate)
-    log_visc_opt_state = log_visc_optimizer.init(log_viscosity)
-
-    param_optimizer = optax.adam(training.param_learning_rate)
-    param_opt_state = param_optimizer.init(params_flat)
-
-    # Gradient functions
-    # jax.grad computes gradients through the tesseract VJP endpoint
-    grad_log_visc = jax.grad(compute_loss_from_log_viscosity, argnums=0)
-    grad_params = jax.grad(compute_loss, argnums=1)
-
-    with pinn:
-        CONSOLE.log(f"{backend.upper()} PINN tesseract initialized")
-        CONSOLE.log("Optimizing...")
-
-        times = []
-        viscosity_history = [float(viscosity)]
-        log_viscosity_history = [float(log_viscosity)]
-        loss_history = {name: [] for name in ("total", "data", "physics", "ic", "bc")}
-        brdr_state = None
-        brdr_weights = None
-        loss_weight_history = {
-            name: [loss_weights[name]] for name in LOSS_WEIGHT_NAMES
-        }
-
-        with make_training_progress() as progress:
-            task_id = progress.add_task(
-                f"{backend.upper()} training",
-                total=training.n_epochs,
-                loss="pending",
-                nu=f"{float(viscosity):.6f}",
-                error=f"{abs(float(viscosity) - problem.true_viscosity):.6f}",
-                epoch_time="pending",
-            )
-
-            for epoch in range(training.n_epochs):
-                start_time = time.time()
-
-                viscosity = jnp.exp(log_viscosity)
-                if training.adaptive_loss_weights:
-                    pointwise_losses = compute_pointwise_losses(
-                        viscosity,
-                        params_flat,
-                        x_obs,
-                        t_obs,
-                        u_obs,
-                        x_col,
-                        t_col,
-                        x_ic,
-                        t_bc,
-                        pinn,
-                    )
-                    if brdr_state is None:
-                        brdr_state = initialize_brdr_state(pointwise_losses)
-                    brdr_state = update_brdr_state(
-                        brdr_state,
-                        pointwise_losses,
-                        beta_c=training.brdr_beta_c,
-                        beta_w=training.brdr_beta_w,
-                        eps=training.brdr_epsilon,
-                    )
-                    brdr_weights = brdr_state["weights"]
-                else:
-                    brdr_weights = None
-
-                # Compute gradients
-                log_v_grad = grad_log_visc(
-                    log_viscosity,
-                    params_flat,
-                    x_obs,
-                    t_obs,
-                    u_obs,
-                    x_col,
-                    t_col,
-                    x_ic,
-                    t_bc,
-                    pinn,
-                    brdr_weights=brdr_weights,
-                    loss_weights=loss_weights,
-                )
-                p_grad = grad_params(
-                    viscosity,
-                    params_flat,
-                    x_obs,
-                    t_obs,
-                    u_obs,
-                    x_col,
-                    t_col,
-                    x_ic,
-                    t_bc,
-                    pinn,
-                    brdr_weights=brdr_weights,
-                    loss_weights=loss_weights,
-                )
-
-                # Both viscosity and parameters are updated
-                log_visc_updates, log_visc_opt_state = log_visc_optimizer.update(
-                    log_v_grad, log_visc_opt_state
-                )
-                log_viscosity = optax.apply_updates(log_viscosity, log_visc_updates)
-                viscosity = jnp.exp(log_viscosity)
-
-                param_updates, param_opt_state = param_optimizer.update(
-                    p_grad, param_opt_state
-                )
-                params_flat = optax.apply_updates(params_flat, param_updates)
-
-                epoch_time = time.time() - start_time
-                times.append(epoch_time)
-                viscosity_history.append(float(viscosity))
-                log_viscosity_history.append(float(log_viscosity))
-                current_weights = (
-                    loss_weights
-                    if brdr_weights is None
-                    else summarize_brdr_weights(brdr_weights)
-                )
-                for name in LOSS_WEIGHT_NAMES:
-                    loss_weight_history[name].append(current_weights[name])
-
-                loss_value = loss_history["total"][-1] if loss_history["total"] else None
-                if epoch % 20 == 0 or epoch == training.n_epochs - 1:
-                    loss_components = compute_loss_components(
-                        viscosity,
-                        params_flat,
-                        x_obs,
-                        t_obs,
-                        u_obs,
-                        x_col,
-                        t_col,
-                        x_ic,
-                        t_bc,
-                        pinn,
-                        brdr_weights=brdr_weights,
-                        loss_weights=loss_weights,
-                    )
-                    for name, value in loss_components.items():
-                        loss_history[name].append(float(value))
-                    loss_value = float(loss_components["total"])
-
-                progress.update(
-                    task_id,
-                    advance=1,
-                    loss=f"{loss_value:.3e}" if loss_value is not None else "pending",
-                    nu=f"{float(viscosity):.6f}",
-                    error=f"{abs(float(viscosity) - problem.true_viscosity):.6f}",
-                    epoch_time=f"{epoch_time * 1000:.0f}ms",
-                )
-
-        final_viscosity = float(viscosity)
-        relative_error = (
-            abs(final_viscosity - problem.true_viscosity)
-            / problem.true_viscosity
-            * 100
-        )
-        avg_time = sum(times) / len(times) * 1000 if times else 0.0
-
-        log_final_results(
-            final_viscosity,
-            problem.true_viscosity,
-            relative_error,
-            avg_time,
-            loss_history,
-            loss_weight_history=loss_weight_history
-            if training.adaptive_loss_weights
-            else None,
-        )
-
-    return {
-        "backend": backend,
-        "final_viscosity": final_viscosity,
-        "true_viscosity": problem.true_viscosity,
-        "relative_error": relative_error,
-        "avg_time_ms": avg_time,
-        "viscosity_history": viscosity_history,
-        "log_viscosity_history": log_viscosity_history,
-        "loss_history": loss_history,
-        "loss_weights": loss_weights,
-        "loss_weight_history": loss_weight_history,
-        "brdr_state": brdr_state,
-        "adaptive_loss_weights": training.adaptive_loss_weights,
-        "seed": data_config.seed,
-        "config": config,
-    }
+    result = train_inverse(config, callback=RichProgressCallback(config))
+    CONSOLE.log(f"Model parameters: {result['params_flat'].size}")
+    return result
 
 
 def compare_backends(
@@ -1123,16 +1388,20 @@ if __name__ == "__main__":
         loss_weights=loss_weights,
     )
 
-    if args.seeds:
-        results = run_seed_sweep(
-            backend=args.backend,
-            seeds=args.seeds,
-            config=config,
-        )
-    elif args.backend == "both":
-        results = compare_backends(config=config)
-    else:
-        results = run_single_backend(
-            backend=args.backend,
-            config=config,
-        )
+    try:
+        if args.seeds:
+            results = run_seed_sweep(
+                backend=args.backend,
+                seeds=args.seeds,
+                config=config,
+            )
+        elif args.backend == "both":
+            results = compare_backends(config=config)
+        else:
+            results = run_single_backend(
+                backend=args.backend,
+                config=config,
+            )
+    except TesseractImageNotFoundError as exc:
+        CONSOLE.print(f"[bold red]Error:[/bold red] {exc}")
+        sys.exit(1)

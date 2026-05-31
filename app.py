@@ -6,32 +6,31 @@ enabling JAX-based optimization of PyTorch PINN models via VJP (Vector-Jacobian 
 
 import json
 import subprocess
-import time
 from dataclasses import dataclass
 
-import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-import optax
 import pandas as pd
 import seaborn as sns
 import streamlit as st
 from tesseract_jax import apply_tesseract
 
-from configs import DEFAULT_LOSS_WEIGHTS, LOSS_WEIGHT_NAMES
+from configs import (
+    DEFAULT_LOSS_WEIGHTS,
+    LOSS_WEIGHT_NAMES,
+    DataConfig,
+    LossWeights,
+    ProblemConfig,
+    RunConfig,
+    TrainingConfig,
+)
 from inverse_problem import (
     Tesseract,
-    compute_loss,
-    compute_loss_components,
-    compute_loss_from_log_viscosity,
-    compute_pointwise_losses,
-    generate_observations,
+    TrainingCallback,
     get_burgers_solver,
-    get_initial_params,
-    initialize_brdr_state,
-    summarize_brdr_weights,
-    update_brdr_state,
+    image_name_for_backend,
+    train_inverse,
 )
 
 st.set_page_config(
@@ -87,32 +86,6 @@ def finish_axes(ax):
     sns.despine(ax=ax)
 
 
-@st.cache_data(show_spinner=False)
-def cached_observations(
-    n_obs,
-    true_viscosity,
-    noise_std,
-    seed,
-    domain_x_min=0.0,
-    domain_x_max=1.0,
-    domain_t_min=0.0,
-    domain_t_max=1.0,
-):
-    """Generate and cache solver-backed observations for repeatable app runs."""
-    domain = {
-        "x": (domain_x_min, domain_x_max),
-        "t": (domain_t_min, domain_t_max),
-    }
-    x_obs, t_obs, u_obs = generate_observations(
-        n_obs,
-        true_viscosity,
-        domain,
-        jax.random.PRNGKey(seed),
-        noise_std=noise_std,
-    )
-    return np.asarray(x_obs), np.asarray(t_obs), np.asarray(u_obs)
-
-
 def history_frame(history, epoch_key="epoch"):
     """Convert a dict of equal-length histories into a dataframe."""
     return pd.DataFrame(
@@ -136,7 +109,7 @@ def docker_image_available(image_name):
 
 def pinn_image_name(backend):
     """Map the selected backend to its local Tesseract image."""
-    return "pinn_jax" if backend == "jax" else "pinn_pytorch"
+    return image_name_for_backend(backend)
 
 
 def render_tesseract_contract(backend, image_name, trace_enabled):
@@ -398,120 +371,178 @@ def render_gradient_flow_inspector(backend, gradient_metrics):
         """)
 
 
-def train_step(
-    backend,
-    log_viscosity,
-    params_flat,
-    brdr_weights,
-    visc_opt_state,
-    param_opt_state,
-    loss_weights,
-    x_obs,
-    t_obs,
-    u_obs,
-    x_col,
-    t_col,
-    x_ic,
-    t_bc,
-    pinn,
-    visc_optimizer,
-    param_optimizer,
-    update_viscosity=True,
-    log_nu_bounds=None,
-    epoch=0,
-    track_gradients=False,
-):
-    """Single training step with optional gradient flow tracking."""
+COMPONENT_LOSS_NAMES = ("total", "data", "physics", "ic", "bc")
 
-    grad_log_visc = jax.grad(compute_loss_from_log_viscosity, argnums=0)
-    grad_params = jax.grad(compute_loss, argnums=1)
 
-    v_grad = grad_log_visc(
-        log_viscosity,
-        params_flat,
-        x_obs,
-        t_obs,
-        u_obs,
-        x_col,
-        t_col,
-        x_ic,
-        t_bc,
-        pinn,
-        brdr_weights=brdr_weights,
-        loss_weights=loss_weights,
-    )
-    viscosity = jnp.exp(log_viscosity)
-    p_grad = grad_params(
-        viscosity,
-        params_flat,
-        x_obs,
-        t_obs,
-        u_obs,
-        x_col,
-        t_col,
-        x_ic,
-        t_bc,
-        pinn,
-        brdr_weights=brdr_weights,
-        loss_weights=loss_weights,
-    )
+class StreamlitTrainingCallback(TrainingCallback):
+    """Drives the live Streamlit UI and accumulates histories during training.
 
-    # Compute gradient norms
-    visc_grad_norm = float(jnp.linalg.norm(v_grad))
-    param_grad_norm = float(jnp.linalg.norm(p_grad))
+    Telemetry (apply/VJP call counts, gradient norms, tensor shapes) is read
+    directly from the engine's per-epoch records, so the diagnostics reflect
+    measured Tesseract behavior rather than hardcoded estimates.
+    """
 
-    # Update log-viscosity so the physical viscosity remains positive.
-    if update_viscosity:
-        visc_updates, visc_opt_state = visc_optimizer.update(v_grad, visc_opt_state)
-        log_viscosity = optax.apply_updates(log_viscosity, visc_updates)
-        if log_nu_bounds is not None:
-            log_viscosity = jnp.clip(log_viscosity, log_nu_bounds[0], log_nu_bounds[1])
-    viscosity = jnp.exp(log_viscosity)
+    def __init__(
+        self,
+        *,
+        true_viscosity,
+        initial_viscosity,
+        adaptive_loss_weights,
+        show_gradient_inspector,
+        placeholders,
+    ):
+        self.true_viscosity = true_viscosity
+        self.adaptive_loss_weights = adaptive_loss_weights
+        self.show_gradient_inspector = show_gradient_inspector
+        self.ph = placeholders
 
-    # Update params
-    param_updates, param_opt_state = param_optimizer.update(p_grad, param_opt_state)
-    params_flat = optax.apply_updates(params_flat, param_updates)
+        self.warmup_epochs = 0
+        self.x_obs = None
+        self.t_obs = None
+        self.u_obs = None
 
-    # Compute loss
-    loss = compute_loss(
-        viscosity,
-        params_flat,
-        x_obs,
-        t_obs,
-        u_obs,
-        x_col,
-        t_col,
-        x_ic,
-        t_bc,
-        pinn,
-        brdr_weights=brdr_weights,
-        loss_weights=loss_weights,
-    )
+        self.visc_history = [float(initial_viscosity)]
+        self.loss_history = []
+        self.time_history = []
+        self.loss_weight_history = {name: [] for name in LOSS_WEIGHT_NAMES}
+        self.component_loss_history = {name: [] for name in COMPONENT_LOSS_NAMES}
+        self.component_loss_epochs = []
+        self.gradient_metrics = []
 
-    metrics = None
-    if track_gradients:
-        metrics = GradientFlowMetrics(
-            epoch=epoch,
-            vjp_calls=2,
-            apply_calls=5,
-            visc_grad_norm=visc_grad_norm,
-            param_grad_norm=param_grad_norm,
-            loss_value=float(loss),
-            shapes={
-                "x_obs": tuple(x_obs.shape),
-                "t_obs": tuple(t_obs.shape),
-                "params_flat": tuple(params_flat.shape),
-            },
+    def on_start(self, context):
+        self.warmup_epochs = context["warmup_epochs"]
+        self.x_obs = np.asarray(context["x_obs"])
+        self.t_obs = np.asarray(context["t_obs"])
+        self.u_obs = np.asarray(context["u_obs"])
+
+    def on_epoch(self, record):
+        self.visc_history.append(record.viscosity)
+        self.loss_history.append(record.loss)
+        self.time_history.append(record.epoch_time)
+        for name in LOSS_WEIGHT_NAMES:
+            self.loss_weight_history[name].append(record.effective_weights[name])
+
+        track_this_epoch = self.show_gradient_inspector and (
+            record.epoch % 5 == 0 or record.epoch < 10
+        )
+        if track_this_epoch:
+            self.gradient_metrics.append(
+                GradientFlowMetrics(
+                    epoch=record.epoch,
+                    vjp_calls=record.vjp_calls,
+                    apply_calls=record.apply_calls,
+                    visc_grad_norm=record.visc_grad_norm,
+                    param_grad_norm=record.param_grad_norm,
+                    loss_value=record.loss,
+                    shapes={
+                        "x_obs": tuple(self.x_obs.shape),
+                        "t_obs": tuple(self.t_obs.shape),
+                        "params_flat": (record.param_count,),
+                    },
+                )
+            )
+
+        if record.loss_components is not None:
+            self.component_loss_epochs.append(record.epoch + 1)
+            for name in COMPONENT_LOSS_NAMES:
+                self.component_loss_history[name].append(
+                    record.loss_components[name]
+                )
+
+        if record.epoch % 5 == 0 or record.epoch == record.n_epochs - 1:
+            self._render_live(record)
+
+    def _render_live(self, record):
+        progress = (record.epoch + 1) / record.n_epochs
+        self.ph["progress_bar"].progress(progress)
+        self.ph["status_text"].text(f"Epoch {record.epoch + 1}/{record.n_epochs}")
+
+        rel_error = abs(record.viscosity - self.true_viscosity) / self.true_viscosity
+        displayed_loss = (
+            record.loss_components["total"]
+            if record.loss_components is not None
+            else record.loss
+        )
+        self.ph["metric_visc"].metric(
+            "Current ν",
+            f"{record.viscosity:.6f}",
+            delta=f"{record.viscosity - self.true_viscosity:.6f}",
+        )
+        self.ph["metric_error"].metric("Relative Error", f"{rel_error * 100:.2f}%")
+        self.ph["metric_loss"].metric("Loss", f"{displayed_loss:.6f}")
+        self.ph["metric_time"].metric(
+            "Epoch Time", f"{record.epoch_time * 1000:.1f}ms"
         )
 
-    return (
-        log_viscosity,
-        params_flat,
-        visc_opt_state,
-        param_opt_state,
-        float(loss),
-        metrics,
-    )
+        fig1, ax1 = plt.subplots(figsize=(6, 4))
+        epochs = np.arange(len(self.visc_history))
+        sns.lineplot(
+            x=epochs,
+            y=self.visc_history,
+            label="Inferred ν",
+            color=PINN_COLOR,
+            linewidth=2.3,
+            ax=ax1,
+        )
+        ax1.axhline(
+            self.true_viscosity,
+            color=TRUE_COLOR,
+            linestyle="--",
+            linewidth=2,
+            label=f"True ν = {self.true_viscosity}",
+        )
+        if self.warmup_epochs:
+            ax1.axvline(
+                self.warmup_epochs,
+                color="#666666",
+                linestyle=":",
+                linewidth=1.5,
+                label="ν warmup end",
+            )
+        ax1.set_xlabel("Epoch")
+        ax1.set_ylabel("Viscosity")
+        ax1.legend(frameon=False)
+        finish_axes(ax1)
+        self.ph["visc_chart"].pyplot(fig1)
+        plt.close(fig1)
+
+        fig2, ax2 = plt.subplots(figsize=(6, 4))
+        sns.lineplot(
+            x=np.arange(len(self.loss_history)),
+            y=self.loss_history,
+            color=LOSS_COLOR,
+            linewidth=2.3,
+            ax=ax2,
+        )
+        ax2.set_yscale("log")
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("Loss (log scale)")
+        finish_axes(ax2)
+        self.ph["loss_chart"].pyplot(fig2)
+        plt.close(fig2)
+
+        weight_chart = self.ph.get("weight_chart")
+        if weight_chart is not None:
+            fig3, ax3 = plt.subplots(figsize=(6, 4))
+            weight_epochs = np.arange(
+                len(next(iter(self.loss_weight_history.values())))
+            )
+            for name in LOSS_WEIGHT_NAMES:
+                sns.lineplot(
+                    x=weight_epochs,
+                    y=self.loss_weight_history[name],
+                    label=name,
+                    color=LOSS_WEIGHT_COLORS[name],
+                    linewidth=2.2,
+                    ax=ax3,
+                )
+            ax3.set_yscale("log")
+            ax3.set_xlabel("Epoch")
+            ax3.set_ylabel("Effective Weight")
+            ax3.legend(frameon=False)
+            finish_axes(ax3)
+            weight_chart.pyplot(fig3)
+            plt.close(fig3)
 
 
 def main():
@@ -567,7 +598,7 @@ updates for log_nu and params_flat""",
     backend = st.sidebar.selectbox(
         "Tesseract PINN Container",
         ["jax", "pytorch"],
-        help="Select backend implementation. Both expose identical Tesseract endpoints (apply/VJP/JVP), enabling seamless backend switching.",
+        help="Select backend implementation. Both expose the same apply/VJP inverse-training contract, enabling seamless backend switching.",
     )
 
     seed = st.sidebar.number_input(
@@ -763,62 +794,46 @@ updates for log_nu and params_flat""",
         st.session_state.gradient_metrics = []
 
     if st.session_state.training:
-        # Setup
-        domain = {"x": (0.0, 1.0), "t": (0.0, 1.0)}
-        key = jax.random.PRNGKey(int(seed))
+        # Build a validated run configuration from the sidebar controls. The
+        # same RunConfig drives the CLI, so the app and CLI share one engine.
+        try:
+            config = RunConfig(
+                backend=backend,
+                problem=ProblemConfig(
+                    true_viscosity=float(true_viscosity),
+                    initial_viscosity=float(initial_viscosity),
+                ),
+                data=DataConfig(
+                    n_obs=int(n_obs),
+                    noise_std=float(noise_level),
+                    seed=int(seed),
+                ),
+                training=TrainingConfig(
+                    n_epochs=int(n_epochs),
+                    log_nu_learning_rate=float(learning_rate),
+                    param_learning_rate=float(param_learning_rate),
+                    adaptive_loss_weights=adaptive_loss_weights,
+                    brdr_beta_c=float(brdr_beta_c),
+                    brdr_beta_w=float(brdr_beta_w),
+                    n_col=int(n_col),
+                    n_ic=int(n_ic),
+                    n_bc=int(n_bc),
+                    viscosity_warmup_epochs=int(viscosity_warmup_epochs),
+                    clip_log_viscosity=bool(clip_log_viscosity),
+                ),
+                loss=LossWeights(**loss_weights),
+            )
+        except (TypeError, ValueError) as exc:
+            st.error(f"Invalid configuration: {exc}")
+            st.session_state.training = False
+            return
 
-        key_col_x, key_col_t, key_ic, key_bc = jax.random.split(key, 4)
-        x_obs_np, t_obs_np, u_obs_np = cached_observations(
-            n_obs,
-            true_viscosity,
-            noise_level,
-            int(seed),
-        )
-        x_obs = jnp.asarray(x_obs_np, dtype=jnp.float32)
-        t_obs = jnp.asarray(t_obs_np, dtype=jnp.float32)
-        u_obs = jnp.asarray(u_obs_np, dtype=jnp.float32)
-
-        # Make collocation points
-        x_col = jax.random.uniform(
-            key_col_x, (n_col,), minval=domain["x"][0], maxval=domain["x"][1]
-        )
-        t_col = jax.random.uniform(
-            key_col_t, (n_col,), minval=0.05, maxval=domain["t"][1]
-        )
-
-        x_ic = jax.random.uniform(
-            key_ic, (n_ic,), minval=domain["x"][0], maxval=domain["x"][1]
-        )
-
-        t_bc = jax.random.uniform(key_bc, (n_bc,), minval=0.05, maxval=domain["t"][1])
-
-        # Initialize tesseract
         image_name = pinn_image_name(backend)
         if not docker_image_available(image_name):
             st.error(f"Tesseract image `{image_name}` was not found.")
             st.code("./buildall.sh", language="bash")
             st.session_state.training = False
             return
-        pinn = Tesseract.from_image(image_name)
-        params_flat = get_initial_params(backend, seed=int(seed))
-
-        # Initialize log-viscosity
-        log_viscosity = jnp.log(jnp.asarray(initial_viscosity))
-        log_nu_bounds = (
-            (
-                jnp.log(jnp.asarray(1e-4, dtype=jnp.float32)),
-                jnp.log(jnp.asarray(0.5, dtype=jnp.float32)),
-            )
-            if clip_log_viscosity
-            else None
-        )
-        brdr_state = None
-        brdr_weights = None
-
-        visc_optimizer = optax.adam(learning_rate)
-        visc_opt_state = visc_optimizer.init(log_viscosity)
-        param_optimizer = optax.adam(param_learning_rate)
-        param_opt_state = param_optimizer.init(params_flat)
 
         col1, col2, col3, col4 = st.columns(4)
         with col1:
@@ -855,12 +870,10 @@ updates for log_nu and params_flat""",
         metric_time = metric_col4.empty()
 
         plot_columns = st.columns(3 if adaptive_loss_weights else 2)
-        plot_col1 = plot_columns[0]
-        plot_col2 = plot_columns[1]
-        with plot_col1:
+        with plot_columns[0]:
             st.subheader("Viscosity Convergence")
             visc_chart = st.empty()
-        with plot_col2:
+        with plot_columns[1]:
             st.subheader("Training Loss")
             loss_chart = st.empty()
         if adaptive_loss_weights:
@@ -870,210 +883,48 @@ updates for log_nu and params_flat""",
         else:
             weight_chart = None
 
-        visc_history = [float(initial_viscosity)]
-        loss_history = []
-        loss_weight_history = {name: [loss_weights[name]] for name in LOSS_WEIGHT_NAMES}
-        component_loss_history = {
-            name: [] for name in ("total", "data", "physics", "ic", "bc")
+        placeholders = {
+            "progress_bar": progress_bar,
+            "status_text": status_text,
+            "metric_visc": metric_visc,
+            "metric_error": metric_error,
+            "metric_loss": metric_loss,
+            "metric_time": metric_time,
+            "visc_chart": visc_chart,
+            "loss_chart": loss_chart,
+            "weight_chart": weight_chart,
         }
-        component_loss_epochs = []
-        time_history = []
 
+        callback = StreamlitTrainingCallback(
+            true_viscosity=true_viscosity,
+            initial_viscosity=initial_viscosity,
+            adaptive_loss_weights=adaptive_loss_weights,
+            show_gradient_inspector=show_gradient_inspector,
+            placeholders=placeholders,
+        )
+
+        pinn = Tesseract.from_image(image_name)
         with pinn:
-            for epoch in range(n_epochs):
-                start_time = time.time()
-
-                # Track gradients every 5 epochs (or first 10) if inspector enabled
-                track_this_epoch = show_gradient_inspector and (
-                    epoch % 5 == 0 or epoch < 10
-                )
-
-                viscosity = jnp.exp(log_viscosity)
-                if adaptive_loss_weights:
-                    pointwise_losses = compute_pointwise_losses(
-                        viscosity,
-                        params_flat,
-                        x_obs,
-                        t_obs,
-                        u_obs,
-                        x_col,
-                        t_col,
-                        x_ic,
-                        t_bc,
-                        pinn,
-                    )
-                    if brdr_state is None:
-                        brdr_state = initialize_brdr_state(pointwise_losses)
-                    brdr_state = update_brdr_state(
-                        brdr_state,
-                        pointwise_losses,
-                        beta_c=brdr_beta_c,
-                        beta_w=brdr_beta_w,
-                    )
-                    brdr_weights = brdr_state["weights"]
-                else:
-                    brdr_weights = None
-
-                (
-                    log_viscosity,
-                    params_flat,
-                    visc_opt_state,
-                    param_opt_state,
-                    loss,
-                    metrics,
-                ) = train_step(
-                    backend,
-                    log_viscosity,
-                    params_flat,
-                    brdr_weights,
-                    visc_opt_state,
-                    param_opt_state,
-                    loss_weights,
-                    x_obs,
-                    t_obs,
-                    u_obs,
-                    x_col,
-                    t_col,
-                    x_ic,
-                    t_bc,
-                    pinn,
-                    visc_optimizer,
-                    param_optimizer,
-                    update_viscosity=epoch >= effective_warmup_epochs,
-                    log_nu_bounds=log_nu_bounds,
-                    epoch=epoch,
-                    track_gradients=track_this_epoch,
-                )
-
-                if metrics and show_gradient_inspector:
-                    st.session_state.gradient_metrics.append(metrics)
-
-                epoch_time = time.time() - start_time
-                time_history.append(epoch_time)
-
-                visc_val = float(jnp.exp(log_viscosity))
-                visc_history.append(visc_val)
-                loss_history.append(loss)
-                current_weights = (
-                    loss_weights
-                    if brdr_weights is None
-                    else summarize_brdr_weights(brdr_weights)
-                )
-                for name in LOSS_WEIGHT_NAMES:
-                    loss_weight_history[name].append(current_weights[name])
-
-                # Update every 5 epochs
-                if epoch % 5 == 0 or epoch == n_epochs - 1:
-                    error = abs(visc_val - true_viscosity)
-                    rel_error = error / true_viscosity * 100
-                    loss_components = compute_loss_components(
-                        jnp.exp(log_viscosity),
-                        params_flat,
-                        x_obs,
-                        t_obs,
-                        u_obs,
-                        x_col,
-                        t_col,
-                        x_ic,
-                        t_bc,
-                        pinn,
-                        brdr_weights=brdr_weights,
-                        loss_weights=loss_weights,
-                    )
-                    component_loss_epochs.append(epoch + 1)
-                    for name in component_loss_history:
-                        component_loss_history[name].append(
-                            float(loss_components[name])
-                        )
-
-                    # Update progress
-                    progress = (epoch + 1) / n_epochs
-                    progress_bar.progress(progress)
-                    status_text.text(f"Epoch {epoch + 1}/{n_epochs}")
-
-                    metric_visc.metric(
-                        "Current ν",
-                        f"{visc_val:.6f}",
-                        delta=f"{visc_val - true_viscosity:.6f}",
-                    )
-                    metric_error.metric("Relative Error", f"{rel_error:.2f}%")
-                    metric_loss.metric("Loss", f"{loss_components['total']:.6f}")
-                    metric_time.metric("Epoch Time", f"{epoch_time * 1000:.1f}ms")
-
-                    fig1, ax1 = plt.subplots(figsize=(6, 4))
-                    epochs = np.arange(len(visc_history))
-                    sns.lineplot(
-                        x=epochs,
-                        y=visc_history,
-                        label="Inferred ν",
-                        color=PINN_COLOR,
-                        linewidth=2.3,
-                        ax=ax1,
-                    )
-                    ax1.axhline(
-                        true_viscosity,
-                        color=TRUE_COLOR,
-                        linestyle="--",
-                        linewidth=2,
-                        label=f"True ν = {true_viscosity}",
-                    )
-                    if effective_warmup_epochs:
-                        ax1.axvline(
-                            effective_warmup_epochs,
-                            color="#666666",
-                            linestyle=":",
-                            linewidth=1.5,
-                            label="ν warmup end",
-                        )
-                    ax1.set_xlabel("Epoch")
-                    ax1.set_ylabel("Viscosity")
-                    ax1.legend(frameon=False)
-                    finish_axes(ax1)
-                    visc_chart.pyplot(fig1)
-                    plt.close(fig1)
-
-                    fig2, ax2 = plt.subplots(figsize=(6, 4))
-                    sns.lineplot(
-                        x=np.arange(len(loss_history)),
-                        y=loss_history,
-                        color=LOSS_COLOR,
-                        linewidth=2.3,
-                        ax=ax2,
-                    )
-                    ax2.set_yscale("log")
-                    ax2.set_xlabel("Epoch")
-                    ax2.set_ylabel("Loss (log scale)")
-                    finish_axes(ax2)
-                    loss_chart.pyplot(fig2)
-                    plt.close(fig2)
-
-                    if weight_chart is not None:
-                        fig3, ax3 = plt.subplots(figsize=(6, 4))
-                        weight_epochs = np.arange(
-                            len(next(iter(loss_weight_history.values())))
-                        )
-                        for name in LOSS_WEIGHT_NAMES:
-                            sns.lineplot(
-                                x=weight_epochs,
-                                y=loss_weight_history[name],
-                                label=name,
-                                color=LOSS_WEIGHT_COLORS[name],
-                                linewidth=2.2,
-                                ax=ax3,
-                            )
-                        ax3.set_yscale("log")
-                        ax3.set_xlabel("Epoch")
-                        ax3.set_ylabel("Effective Weight")
-                        ax3.legend(frameon=False)
-                        finish_axes(ax3)
-                        weight_chart.pyplot(fig3)
-                        plt.close(fig3)
+            result = train_inverse(
+                config, pinn=pinn, callback=callback, metrics_every=5
+            )
 
             st.markdown("---")
             st.success("Finished training.")
 
-            final_visc = float(jnp.exp(log_viscosity))
-            final_error = abs(final_visc - true_viscosity) / true_viscosity * 100
+            final_visc = result["final_viscosity"]
+            final_error = result["relative_error"]
+            params_flat = result["params_flat"]
+            x_obs, t_obs, u_obs = result["observations"]
+            effective_warmup_epochs = result["warmup_epochs"]
+
+            visc_history = callback.visc_history
+            loss_history = callback.loss_history
+            time_history = callback.time_history
+            loss_weight_history = callback.loss_weight_history
+            component_loss_history = callback.component_loss_history
+            component_loss_epochs = callback.component_loss_epochs
+            st.session_state.gradient_metrics = callback.gradient_metrics
 
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Final Viscosity", f"{final_visc:.6f}")
@@ -1154,7 +1005,7 @@ updates for log_nu and params_flat""",
                     "Solution Field",
                     "BRDR Weights",
                     "Tesseract Trace",
-                    "Backend Equivalence",
+                    "Backend Consistency",
                 ]
             )
 
@@ -1333,11 +1184,26 @@ updates for log_nu and params_flat""",
                     jax_visc = st.session_state.trained_viscosity["jax"]
                     pytorch_visc = st.session_state.trained_viscosity["pytorch"]
                     visc_diff = abs(jax_visc - pytorch_visc)
-                    st.subheader("Backend Equivalence Report")
+                    rel_spread = (
+                        visc_diff / true_viscosity * 100 if true_viscosity else 0.0
+                    )
+                    st.subheader("Backend Consistency Report")
+                    st.caption(
+                        "The two backends start from independent random initializations "
+                        "(JAX PRNG vs. torch.manual_seed), so they are not bit-for-bit "
+                        "equivalent. This is a consistency check: under the same objective, "
+                        "data, and seed, both Tesseract backends recover ν to within a small "
+                        "spread — evidence the autodiff contract is backend-agnostic."
+                    )
                     col1, col2, col3 = st.columns(3)
                     col1.metric("JAX Result", f"{jax_visc:.6f}")
                     col2.metric("PyTorch Result", f"{pytorch_visc:.6f}")
-                    col3.metric("Absolute Difference", f"{visc_diff:.6f}")
+                    col3.metric(
+                        "|Δν| (% of true ν)",
+                        f"{visc_diff:.6f}",
+                        delta=f"{rel_spread:.2f}%",
+                        delta_color="off",
+                    )
 
                     equivalence_df = pd.DataFrame(
                         [
@@ -1413,7 +1279,7 @@ updates for log_nu and params_flat""",
                     plt.close(fig)
                 else:
                     st.info(
-                        f"Train the {other_backend.upper()} Tesseract container next to populate the backend equivalence report."
+                        f"Train the {other_backend.upper()} Tesseract container next to populate the backend consistency report."
                     )
                     st.dataframe(
                         pd.DataFrame(
@@ -1442,7 +1308,7 @@ updates for log_nu and params_flat""",
         2. Route PINN apply/VJP calls through the selected Tesseract container
         3. Infer the viscosity parameter and monitor gradient flow across the boundary
         4. Visualize the learned field against the solver-generated ground truth
-        5. Switch containers and retrain with the same settings to check backend equivalence
+        5. Switch containers and retrain with the same settings to check backend consistency
         """
         )
 
@@ -1466,7 +1332,7 @@ updates for log_nu and params_flat""",
 
             if len(trained_backends) == 1:
                 st.info(
-                    "Train the other Tesseract container to populate the backend equivalence report."
+                    "Train the other Tesseract container to populate the backend consistency report."
                 )
 
 

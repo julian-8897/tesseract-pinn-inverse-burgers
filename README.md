@@ -10,7 +10,7 @@
 This project estimates the viscosity coefficient of the 1D viscous Burgers equation from noisy observations. The inverse solver uses a physics-informed neural network (PINN) exposed as a Tesseract, with interchangeable JAX and PyTorch backends. The outer optimization loop stays in JAX; when the PyTorch backend runs, Tesseract routes gradients through the PyTorch VJP endpoint.
 
 **Key implementations:**
-- JAX and PyTorch PINN Tesseracts with `apply`, `vector_jacobian_product`, and `jacobian_vector_product` endpoints
+- JAX and PyTorch PINN Tesseracts with a shared `apply`/`vector_jacobian_product` inverse-training contract
 - Differentiable pseudospectral Burgers solver Tesseract for solver-generated observations
 - One JAX inverse-training loop that can optimize through either PINN backend
 - Configurable loss weights, `log_nu` optimization, seeded runs, and seed-sweep summaries
@@ -60,29 +60,28 @@ where:
 
 ### Architecture
 
-The PINN uses Fourier feature encoding to mitigate spectral bias:
+The PINN uses fixed Fourier feature encoding to mitigate spectral bias:
 
 ```
 Input (x, t) ∈ ℝ²
     ↓
-Fourier encoding: [x, t, sin(x·B_x), cos(x·B_x), sin(t·B_t), cos(t·B_t)]
+Fixed Fourier encoding: [x, t, sin(x·B_x), cos(x·B_x), sin(t·B_t), cos(t·B_t)]
     ↓
 MLP: 130 → 64 → 64 → 64 → 1 (tanh activations)
     ↓
 Output: u(x, t)
 ```
 
-Derivatives ($\partial u/\partial x$, $\partial u/\partial t$, $\partial^2 u/\partial x^2$) are computed via automatic differentiation within each Tesseract using the native framework's autograd: `jax.grad` for the JAX backend and `torch.autograd.grad` for the PyTorch backend.
+The Fourier frequencies are deterministic backend-independent constants. The flattened trainable parameter vector contains only MLP weights and biases, giving the JAX and PyTorch containers the same trainable-parameter contract. Derivatives ($\partial u/\partial x$, $\partial u/\partial t$, $\partial^2 u/\partial x^2$) are computed via automatic differentiation within each Tesseract using the native framework's autograd: `jax.grad` for the JAX backend and `torch.autograd.grad` for the PyTorch backend.
 
 ### Tesseract Endpoints
 
-The `pinn_jax` and `pinn_pytorch` Tesseracts implement:
+The inverse-training showcase exercises these `pinn_jax` and `pinn_pytorch` endpoints:
 
 1. **apply(inputs)**: Forward pass returning u_pred, u_x, u_t, u_xx
 2. **vector_jacobian_product(...)**: Reverse-mode AD for gradient computation
-3. **jacobian_vector_product(...)**: Forward-mode AD for sensitivity analysis (not used by the inverse trainer)
 
-The `burgers_solver` Tesseract implements the same `apply`, VJP, and JVP endpoint pattern for differentiable solver runs. In the current inverse-problem demo it is used offline to generate ground-truth observations; differentiating through the solver during optimization is a planned extension.
+JVP endpoints are secondary to the current demo because the inverse trainer uses reverse-mode gradients through `jax.grad`. The `burgers_solver` Tesseract implements the same `apply`, VJP, and JVP endpoint pattern for differentiable solver runs. In the current inverse-problem demo it is used offline to generate ground-truth observations; differentiating through the solver during optimization is a planned extension.
 
 Input/output schemas use Tesseract's `Differentiable[Array[...]]` annotations to declare which fields participate in autodiff.
 
