@@ -18,9 +18,7 @@ def test_generate_observations_uses_burgers_solver_not_heat_equation():
     domain = {"x": (0.0, 1.0), "t": (0.0, 1.0)}
     key = jax.random.PRNGKey(123)
 
-    x_obs, t_obs, u_obs = generate_observations(
-        n_points, true_viscosity, domain, key
-    )
+    x_obs, t_obs, u_obs = generate_observations(n_points, true_viscosity, domain, key)
 
     assert x_obs.shape == (n_points,)
     assert t_obs.shape == (n_points,)

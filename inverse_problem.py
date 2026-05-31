@@ -9,10 +9,12 @@ Problem: Given noisy observations u(x,t), infer viscosity parameter ν
 in Burgers equation: ∂u/∂t + u·∂u/∂x = ν·∂²u/∂x²
 """
 
+import csv
+import json
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from statistics import fmean, pstdev
 
@@ -41,7 +43,6 @@ from configs import (
     normalize_loss_weights,
 )
 
-
 REPO_ROOT = Path(__file__).resolve().parent
 CONSOLE = Console()
 
@@ -69,12 +70,10 @@ def initialize_brdr_state(pointwise_losses):
     return {
         "step": 0,
         "moment": {
-            name: jnp.zeros_like(losses)
-            for name, losses in pointwise_losses.items()
+            name: jnp.zeros_like(losses) for name, losses in pointwise_losses.items()
         },
         "weights": {
-            name: jnp.ones_like(losses)
-            for name, losses in pointwise_losses.items()
+            name: jnp.ones_like(losses) for name, losses in pointwise_losses.items()
         },
     }
 
@@ -117,10 +116,7 @@ def update_brdr_state(state, pointwise_losses, beta_c=0.9999, beta_w=0.999, eps=
 
 def summarize_brdr_weights(brdr_weights):
     """Return mean BRDR weight by component for logging and plotting."""
-    return {
-        name: float(jnp.mean(brdr_weights[name]))
-        for name in LOSS_WEIGHT_NAMES
-    }
+    return {name: float(jnp.mean(brdr_weights[name])) for name in LOSS_WEIGHT_NAMES}
 
 
 def build_run_config(
@@ -296,9 +292,7 @@ def summarize_seed_results(results):
     backends = sorted({result["backend"] for result in results})
 
     for backend in backends:
-        backend_results = [
-            result for result in results if result["backend"] == backend
-        ]
+        backend_results = [result for result in results if result["backend"] == backend]
         viscosities = [result["final_viscosity"] for result in backend_results]
         errors = [result["relative_error"] for result in backend_results]
         times = [result["avg_time_ms"] for result in backend_results]
@@ -360,30 +354,30 @@ def get_burgers_solver():
 
 def get_initial_params(backend="jax", seed=42):
     """Get initial parameters for the specified backend."""
+    backend_path = REPO_ROOT / "tesseracts" / f"pinn_{backend}"
+    previous_module = sys.modules.pop("tesseract_api", None)
+    sys.path.insert(0, str(backend_path))
+
     if backend == "jax":
-        sys.path.insert(0, "tesseracts/pinn_jax")
-        from tesseract_api import PINNNet, flatten_params
-
-        model = PINNNet(jax.random.PRNGKey(seed))
-        params = flatten_params(model)
-        sys.path.pop(0)
-        # Clear the imported module to avoid conflicts
-        if "tesseract_api" in sys.modules:
-            del sys.modules["tesseract_api"]
-        return jnp.array(params)
+        key = jax.random.PRNGKey(seed)
     else:  # pytorch
-        # For PyTorch, initialize from actual model for proper initialization
-        sys.path.insert(0, "tesseracts/pinn_pytorch")
+        torch.manual_seed(seed)
+
+    try:
         from tesseract_api import PINNNet, flatten_params
 
-        torch.manual_seed(seed)
-        model = PINNNet(hidden_sizes=[64, 64, 64], n_fourier_features=32, seed=seed)
-        params = flatten_params(model)
+        if backend == "jax":
+            model = PINNNet(key)
+        else:
+            # For PyTorch, initialize from actual model for proper initialization.
+            model = PINNNet(hidden_sizes=[64, 64, 64], n_fourier_features=32, seed=seed)
+        return jnp.array(flatten_params(model))
+    finally:
         sys.path.pop(0)
-        # Clear the imported module to avoid conflicts
         if "tesseract_api" in sys.modules:
             del sys.modules["tesseract_api"]
-        return jnp.array(params)
+        if previous_module is not None:
+            sys.modules["tesseract_api"] = previous_module
 
 
 def generate_observations(n_points, true_viscosity, domain, key, noise_std=0.02):
@@ -869,9 +863,7 @@ def train_inverse(config, *, pinn=None, callback=None, metrics_every=20):
             jnp.log(jnp.asarray(training.nu_clip_min, dtype=jnp.float32)),
             jnp.log(jnp.asarray(training.nu_clip_max, dtype=jnp.float32)),
         )
-    warmup_epochs = min(
-        training.viscosity_warmup_epochs, max(0, training.n_epochs - 1)
-    )
+    warmup_epochs = min(training.viscosity_warmup_epochs, max(0, training.n_epochs - 1))
 
     log_visc_optimizer = optax.adam(training.log_nu_learning_rate)
     log_visc_opt_state = log_visc_optimizer.init(log_viscosity)
@@ -1118,6 +1110,92 @@ class RichProgressCallback(TrainingCallback):
         )
 
 
+class MetricsRecorderCallback(RichProgressCallback):
+    """CLI callback that records per-epoch metrics while showing progress."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.rows = []
+
+    def on_epoch(self, record):
+        self.rows.append(
+            {
+                "epoch": record.epoch,
+                "viscosity": record.viscosity,
+                "log_viscosity": record.log_viscosity,
+                "loss": record.loss,
+                "visc_grad_norm": record.visc_grad_norm,
+                "param_grad_norm": record.param_grad_norm,
+                "epoch_time": record.epoch_time,
+                "apply_calls": record.apply_calls,
+                "vjp_calls": record.vjp_calls,
+                "viscosity_updated": record.viscosity_updated,
+            }
+        )
+        super().on_epoch(record)
+
+
+def _to_jsonable(value):
+    """Convert dataclass/JAX/NumPy scalars and containers to JSON-safe values."""
+    if is_dataclass(value):
+        return _to_jsonable(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [_to_jsonable(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    return value
+
+
+def write_run_artifacts(result, rows, out_dir):
+    """Write reproducible CLI run artifacts without serializing live objects."""
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    with (out_path / "config.json").open("w", encoding="utf-8") as file:
+        json.dump(_to_jsonable(result["config"]), file, indent=2, sort_keys=True)
+        file.write("\n")
+
+    fieldnames = [
+        "epoch",
+        "viscosity",
+        "log_viscosity",
+        "loss",
+        "visc_grad_norm",
+        "param_grad_norm",
+        "epoch_time",
+        "apply_calls",
+        "vjp_calls",
+        "viscosity_updated",
+    ]
+    with (out_path / "metrics.csv").open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    last_row = rows[-1] if rows else {}
+    summary = {
+        "backend": result["backend"],
+        "tesseract_image": result["tesseract_image"],
+        "seed": result["seed"],
+        "true_viscosity": result["true_viscosity"],
+        "final_viscosity": result["final_viscosity"],
+        "relative_error": result["relative_error"],
+        "avg_time_ms": result["avg_time_ms"],
+        "epochs": len(result["viscosity_history"]) - 1,
+        "apply_calls_per_step": last_row.get("apply_calls"),
+        "vjp_calls_per_step": last_row.get("vjp_calls"),
+        "adaptive_loss_weights": result["adaptive_loss_weights"],
+    }
+    with (out_path / "summary.json").open("w", encoding="utf-8") as file:
+        json.dump(_to_jsonable(summary), file, indent=2, sort_keys=True)
+        file.write("\n")
+
+
 def run_inverse_problem(
     config=None,
     backend=None,
@@ -1161,7 +1239,9 @@ def run_inverse_problem(
     ensure_image_available(image_name_for_backend(config.backend))
     log_run_header(config)
 
-    result = train_inverse(config, callback=RichProgressCallback(config))
+    callback = MetricsRecorderCallback(config)
+    result = train_inverse(config, callback=callback)
+    result["metrics_rows"] = callback.rows
     CONSOLE.log(f"Model parameters: {result['params_flat'].size}")
     return result
 
@@ -1293,6 +1373,33 @@ def run_seed_sweep(
     return results
 
 
+def write_cli_artifacts(results, out_dir):
+    """Write artifacts for CLI result objects returned by this module."""
+    timestamp = time.strftime("%Y%m%dT%H%M%S")
+    root = Path(out_dir) / timestamp
+
+    if isinstance(results, dict) and "backend" in results:
+        write_run_artifacts(
+            results,
+            results.get("metrics_rows", []),
+            root / results["backend"],
+        )
+    elif isinstance(results, dict):
+        for backend, result in results.items():
+            write_run_artifacts(result, result.get("metrics_rows", []), root / backend)
+    else:
+        for result in results:
+            seed_dir = f"seed-{result['seed']}"
+            write_run_artifacts(
+                result,
+                result.get("metrics_rows", []),
+                root / seed_dir / result["backend"],
+            )
+
+    CONSOLE.log(f"Wrote run artifacts to {root}")
+    return root
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -1363,6 +1470,11 @@ if __name__ == "__main__":
         default=DEFAULT_LOSS_WEIGHTS["bc"],
         help="Boundary-condition loss weight",
     )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        help="Directory for reproducible run artifacts",
+    )
     args = parser.parse_args()
 
     try:
@@ -1402,6 +1514,8 @@ if __name__ == "__main__":
                 backend=args.backend,
                 config=config,
             )
+        if args.out is not None:
+            write_cli_artifacts(results, args.out)
     except TesseractImageNotFoundError as exc:
         CONSOLE.print(f"[bold red]Error:[/bold red] {exc}")
         sys.exit(1)

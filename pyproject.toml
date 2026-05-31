@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tesseract-hackathon"
+name = "tesseract-pinn-inverse-burgers"
 version = "0.1.0"
-description = "Add your description here"
+description = "Tesseract cross-framework PINN inverse problem for 1D Burgers viscosity inference"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -25,5 +25,16 @@ dependencies = [
     "torchvision>=0.24.1",
 ]
 
-[tool.setuptools.packages.find]
-include = ["tesseracts*"]
+[tool.setuptools]
+py-modules = ["app", "configs", "inverse_problem"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["E402"]

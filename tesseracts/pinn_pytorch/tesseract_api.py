@@ -15,7 +15,6 @@ import torch.nn as nn
 from pydantic import BaseModel, Field
 from tesseract_core.runtime import Array, Differentiable, Float32
 
-
 FOURIER_FEATURE_SEED = 0
 
 
@@ -61,9 +60,11 @@ class OutputSchema(BaseModel):
 class PINNNet(nn.Module):
     """Simple MLP for PINN with Fourier feature encoding (PyTorch)."""
 
-    def __init__(self, hidden_sizes=[64, 64, 64], n_fourier_features=32, seed=0):
+    def __init__(self, hidden_sizes=None, n_fourier_features=32, seed=0):
         """Initialize trainable MLP with fixed Fourier features."""
         super().__init__()
+        if hidden_sizes is None:
+            hidden_sizes = [64, 64, 64]
 
         torch.manual_seed(seed)
 
@@ -76,7 +77,7 @@ class PINNNet(nn.Module):
         layer_sizes = [input_dim] + hidden_sizes + [1]
 
         layers = []
-        for in_size, out_size in zip(layer_sizes[:-1], layer_sizes[1:]):
+        for in_size, out_size in zip(layer_sizes[:-1], layer_sizes[1:], strict=True):
             layers.append(nn.Linear(in_size, out_size))
         self.layers = nn.ModuleList(layers)
 

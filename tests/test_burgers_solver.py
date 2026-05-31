@@ -6,7 +6,6 @@ import sys
 import jax
 import jax.numpy as jnp
 
-
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tesseracts" / "burgers_solver"))
 

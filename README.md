@@ -5,6 +5,7 @@
 [![JAX 0.8.2](https://img.shields.io/badge/JAX-0.8.2-red)](https://github.com/google/jax)
 [![PyTorch 2.9.1](https://img.shields.io/badge/PyTorch-2.9.1-orange)](https://pytorch.org/)
 [![Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-orange.svg)](LICENSE)
+[![CI](https://github.com/julian-8897/tesseract-pinn-inverse-burgers/actions/workflows/ci.yml/badge.svg)](https://github.com/julian-8897/tesseract-pinn-inverse-burgers/actions/workflows/ci.yml)
 
 **Overview**
 This project estimates the viscosity coefficient of the 1D viscous Burgers equation from noisy observations. The inverse solver uses a physics-informed neural network (PINN) exposed as a Tesseract, with interchangeable JAX and PyTorch backends. The outer optimization loop stays in JAX; when the PyTorch backend runs, Tesseract routes gradients through the PyTorch VJP endpoint.
@@ -93,19 +94,14 @@ The CLI path in `inverse_problem.py` optimizes the viscosity in log space:
 # Load backend (JAX or PyTorch)
 pinn = Tesseract.from_image("pinn_jax")  # or "pinn_pytorch"
 
-# Keep viscosity positive without clipping the optimized variable
-nu = jnp.exp(log_nu)
-loss = compute_loss(nu, params, x_obs, t_obs, u_obs, ..., pinn)
+# One reverse-mode pass returns loss and both optimized gradients.
+loss_and_grads = jax.value_and_grad(_loss_from_log_and_params, argnums=(0, 1))
+loss, (log_nu_grad, params_grad) = loss_and_grads(log_nu, params, ..., pinn)
 
-# System-level gradients computed via Tesseract VJP (regardless of backend)
-grad_log_nu = jax.grad(compute_loss_from_log_viscosity, argnums=0)
-grad_params = jax.grad(compute_loss, argnums=1)
-
-# When jax.grad is called, it triggers Tesseract's VJP endpoint
+# The objective evaluates the PDE residual with nu = exp(log_nu).
+# When jax.value_and_grad runs, it triggers Tesseract's VJP endpoint.
 # For PyTorch backend: Tesseract VJP internally uses torch.autograd.grad
 # For JAX backend: Tesseract VJP internally uses jax.grad
-log_nu_grad = grad_log_nu(log_nu, params, ...)
-p_grad = grad_params(nu, params, ...)
 ```
 
 > **Key point:** The system-level gradients ($\partial \mathcal{L}/\partial \log\nu$ and $\partial \mathcal{L}/\partial \text{params}$) use Tesseract's `vector_jacobian_product` endpoint for both backends. The backend selection determines which autograd implementation Tesseract uses inside the VJP computation.
@@ -159,16 +155,8 @@ tesseract-pinn-inverse-burgers/
 git clone https://github.com/julian-8897/tesseract-pinn-inverse-burgers.git
 cd tesseract-pinn-inverse-burgers
 
-# Option A: using uv
-# Install uv if missing: pip install uv
-uv venv
-source .venv/bin/activate
-uv pip install -e .
-
-# Option B: using python venv
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+# Install Python dependencies from pyproject.toml / uv.lock
+uv sync
 
 # Build Tesseract containers (requires Docker running)
 ./buildall.sh
@@ -204,6 +192,9 @@ uv run python inverse_problem.py --backend jax --epochs 100 \
 
 # Seed sweep with summary statistics
 uv run python inverse_problem.py --backend jax --epochs 50 --seeds 0 1 2 3 4
+
+# Write reproducible benchmark artifacts
+uv run python inverse_problem.py --backend both --epochs 100 --seed 123 --out runs
 ```
 
 ### Streamlit
@@ -224,8 +215,15 @@ The CLI is the reference path for dataclass configs and seeded runs. The Streaml
 ### Tests
 
 ```bash
-uv run --with pytest python -m pytest tests -q
+make compile
+make lint
+make test
+make smoke
 ```
+
+`make smoke` runs the live container round-trip test and skips cleanly when the
+local Tesseract images have not been built. `pyproject.toml` is the dependency
+source of truth; no separate `requirements.txt` is maintained.
 
 ---
 
@@ -264,6 +262,9 @@ Regenerate these figures before treating them as benchmark results for the lates
 ## Current Status
 
 - The CLI inverse pipeline uses solver-generated noisy Burgers observations.
+- The CLI and Streamlit app share `train_inverse`, a callback-driven training engine.
+- Each training step uses one `jax.value_and_grad` over `log_nu` and the flattened PINN parameters.
+- Tesseract apply/VJP counts are measured through the `tesseract_jax` dispatch layer.
 - The solver generates observations offline for training. End-to-end differentiation through the solver during inverse training remains future work.
 - Loss weights can be fixed manually or adapted with opt-in BRDR pointwise residual weighting.
 - The PINN backend can be JAX or PyTorch; Tesseract exposes both through the same `apply`/VJP/JVP interface.

@@ -445,9 +445,7 @@ class StreamlitTrainingCallback(TrainingCallback):
         if record.loss_components is not None:
             self.component_loss_epochs.append(record.epoch + 1)
             for name in COMPONENT_LOSS_NAMES:
-                self.component_loss_history[name].append(
-                    record.loss_components[name]
-                )
+                self.component_loss_history[name].append(record.loss_components[name])
 
         if record.epoch % 5 == 0 or record.epoch == record.n_epochs - 1:
             self._render_live(record)
@@ -470,9 +468,7 @@ class StreamlitTrainingCallback(TrainingCallback):
         )
         self.ph["metric_error"].metric("Relative Error", f"{rel_error * 100:.2f}%")
         self.ph["metric_loss"].metric("Loss", f"{displayed_loss:.6f}")
-        self.ph["metric_time"].metric(
-            "Epoch Time", f"{record.epoch_time * 1000:.1f}ms"
-        )
+        self.ph["metric_time"].metric("Epoch Time", f"{record.epoch_time * 1000:.1f}ms")
 
         fig1, ax1 = plt.subplots(figsize=(6, 4))
         epochs = np.arange(len(self.visc_history))

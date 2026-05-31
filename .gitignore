@@ -55,6 +55,7 @@ tesseract_cache/
 
 # Logs
 *.log
+runs/
 
 # Local planning / agent notes
 AGENTS.md

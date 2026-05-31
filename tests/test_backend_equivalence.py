@@ -6,7 +6,6 @@ import pathlib
 import jax
 import numpy as np
 
-
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 

@@ -17,7 +17,6 @@ from pydantic import BaseModel, Field
 from tesseract_core.runtime import Array, Differentiable, Float32
 from tesseract_core.runtime.tree_transforms import filter_func, flatten_with_paths
 
-
 FOURIER_FEATURE_SEED = 0
 
 
@@ -68,8 +67,10 @@ class PINNNet(eqx.Module):
     B_x: jax.Array
     B_t: jax.Array
 
-    def __init__(self, key, hidden_sizes=[64, 64, 64], n_fourier_features=32):
+    def __init__(self, key, hidden_sizes=None, n_fourier_features=32):
         """Initialize trainable MLP with fixed Fourier features."""
+        if hidden_sizes is None:
+            hidden_sizes = [64, 64, 64]
 
         # Fixed Fourier feature frequencies keep the trainable parameter contract
         # identical across the JAX and PyTorch backends.
@@ -81,7 +82,9 @@ class PINNNet(eqx.Module):
         layer_keys = jax.random.split(key, len(layer_sizes) - 1)
 
         self.layers = []
-        for i, (in_size, out_size) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:])):
+        for i, (in_size, out_size) in enumerate(
+            zip(layer_sizes[:-1], layer_sizes[1:], strict=True)
+        ):
             self.layers.append(eqx.nn.Linear(in_size, out_size, key=layer_keys[i]))
 
     def __call__(self, x, t):
@@ -137,7 +140,7 @@ def unflatten_params(params_flat, reference_key=None):
 
     unflattened_leaves = []
     start = 0
-    for shape, size in zip(shapes, sizes):
+    for shape, size in zip(shapes, sizes, strict=True):
         unflattened_leaves.append(params_flat[start : start + size].reshape(shape))
         start += size
 
@@ -210,8 +213,12 @@ def vector_jacobian_product(
 
 def abstract_eval(abstract_inputs):
     """Calculate output shape."""
-    is_shapedtype_dict = lambda x: type(x) is dict and (x.keys() == {"shape", "dtype"})
-    is_shapedtype_struct = lambda x: isinstance(x, jax.ShapeDtypeStruct)
+
+    def is_shapedtype_dict(x):
+        return type(x) is dict and (x.keys() == {"shape", "dtype"})
+
+    def is_shapedtype_struct(x):
+        return isinstance(x, jax.ShapeDtypeStruct)
 
     jaxified_inputs = jax.tree.map(
         lambda x: jax.ShapeDtypeStruct(**x) if is_shapedtype_dict(x) else x,
@@ -228,9 +235,9 @@ def abstract_eval(abstract_inputs):
 
     jax_shapes = jax.eval_shape(wrapped_apply, dynamic_inputs)
     return jax.tree.map(
-        lambda x: {"shape": x.shape, "dtype": str(x.dtype)}
-        if is_shapedtype_struct(x)
-        else x,
+        lambda x: (
+            {"shape": x.shape, "dtype": str(x.dtype)} if is_shapedtype_struct(x) else x
+        ),
         jax_shapes,
         is_leaf=is_shapedtype_struct,
     )

@@ -178,8 +178,12 @@ def vector_jacobian_product(
 
 def abstract_eval(abstract_inputs):
     """Calculate output shapes."""
-    is_shapedtype_dict = lambda x: type(x) is dict and (x.keys() == {"shape", "dtype"})
-    is_shapedtype_struct = lambda x: isinstance(x, jax.ShapeDtypeStruct)
+
+    def is_shapedtype_dict(x):
+        return type(x) is dict and (x.keys() == {"shape", "dtype"})
+
+    def is_shapedtype_struct(x):
+        return isinstance(x, jax.ShapeDtypeStruct)
 
     jaxified_inputs = jax.tree.map(
         lambda x: jax.ShapeDtypeStruct(**x) if is_shapedtype_dict(x) else x,
@@ -196,9 +200,9 @@ def abstract_eval(abstract_inputs):
 
     jax_shapes = jax.eval_shape(wrapped_apply, dynamic_inputs)
     return jax.tree.map(
-        lambda x: {"shape": x.shape, "dtype": str(x.dtype)}
-        if is_shapedtype_struct(x)
-        else x,
+        lambda x: (
+            {"shape": x.shape, "dtype": str(x.dtype)} if is_shapedtype_struct(x) else x
+        ),
         jax_shapes,
         is_leaf=is_shapedtype_struct,
     )

@@ -2069,7 +2069,20 @@ runtime = [
 ]
 
 [[package]]
-name = "tesseract-hackathon"
+name = "tesseract-jax"
+version = "0.2.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jax" },
+    { name = "tesseract-core" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9b/67/a05ee0dfd8d17f6cad730dfceea56ad3a36456bfa44cd18b1cf904e9d585/tesseract_jax-0.2.3.tar.gz", hash = "sha256:d3da81cacb898ac07ddadab00a4bca2562c412e6d7247f413a04cf41d465d147", size = 19703, upload-time = "2025-12-12T20:35:57.793Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/47/1a/c241549458e2d22a8290f656a78a1890b48d12cfb7ff0229c5e432d91e59/tesseract_jax-0.2.3-py3-none-any.whl", hash = "sha256:cbd24407e738c2aaf455d5388f01b07a8481fe6e2ada51bd91c980f8aab44121", size = 15076, upload-time = "2025-12-12T20:35:56.377Z" },
+]
+
+[[package]]
+name = "tesseract-pinn-inverse-burgers"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -2105,19 +2118,6 @@ requires-dist = [
     { name = "tesseract-jax", specifier = ">=0.2.3" },
     { name = "torch", specifier = ">=2.9.1" },
     { name = "torchvision", specifier = ">=0.24.1" },
-]
-
-[[package]]
-name = "tesseract-jax"
-version = "0.2.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "jax" },
-    { name = "tesseract-core" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/9b/67/a05ee0dfd8d17f6cad730dfceea56ad3a36456bfa44cd18b1cf904e9d585/tesseract_jax-0.2.3.tar.gz", hash = "sha256:d3da81cacb898ac07ddadab00a4bca2562c412e6d7247f413a04cf41d465d147", size = 19703, upload-time = "2025-12-12T20:35:57.793Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/47/1a/c241549458e2d22a8290f656a78a1890b48d12cfb7ff0229c5e432d91e59/tesseract_jax-0.2.3-py3-none-any.whl", hash = "sha256:cbd24407e738c2aaf455d5388f01b07a8481fe6e2ada51bd91c980f8aab44121", size = 15076, upload-time = "2025-12-12T20:35:56.377Z" },
 ]
 
 [[package]]

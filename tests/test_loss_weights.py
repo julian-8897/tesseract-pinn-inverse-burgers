@@ -3,8 +3,8 @@
 import pathlib
 import sys
 
-import pytest
 import jax.numpy as jnp
+import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -55,9 +55,7 @@ def test_update_brdr_state_keeps_unit_global_mean_weight():
         "bc": jnp.array([0.05, 0.1]),
     }
     state = initialize_brdr_state(pointwise_losses)
-    updated = update_brdr_state(
-        state, pointwise_losses, beta_c=0.9, beta_w=0.0
-    )
+    updated = update_brdr_state(state, pointwise_losses, beta_c=0.9, beta_w=0.0)
 
     all_weights = jnp.concatenate(
         [jnp.ravel(updated["weights"][name]) for name in DEFAULT_LOSS_WEIGHTS]
