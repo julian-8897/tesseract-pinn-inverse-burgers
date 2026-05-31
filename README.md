@@ -8,13 +8,19 @@
 [![CI](https://github.com/julian-8897/tesseract-pinn-inverse-burgers/actions/workflows/ci.yml/badge.svg)](https://github.com/julian-8897/tesseract-pinn-inverse-burgers/actions/workflows/ci.yml)
 
 **Overview**
-This project estimates the viscosity coefficient of the 1D viscous Burgers equation from noisy observations. The inverse solver uses a physics-informed neural network (PINN) exposed as a Tesseract, with interchangeable JAX and PyTorch backends. The outer optimization loop stays in JAX; when the PyTorch backend runs, Tesseract routes gradients through the PyTorch VJP endpoint.
+This project estimates the viscosity coefficient of the 1D viscous Burgers
+equation from noisy observations. The inverse solver uses a physics-informed
+neural network (PINN) exposed as a Tesseract, with interchangeable JAX and
+PyTorch backends. The outer optimization loop stays in JAX/Optax for both
+backends; when the PyTorch backend runs, Tesseract routes `jax.value_and_grad`
+through the PyTorch VJP endpoint.
 
 **Key implementations:**
 - JAX and PyTorch PINN Tesseracts with a shared `apply`/`vector_jacobian_product` inverse-training contract
 - Differentiable pseudospectral Burgers solver Tesseract for solver-generated observations
-- One JAX inverse-training loop that can optimize through either PINN backend
-- Configurable loss weights, `log_nu` optimization, seeded runs, and seed-sweep summaries
+- Shared `train_inverse(...)` engine used by both the CLI and Streamlit app
+- Measured Tesseract apply/VJP telemetry for each gradient step
+- Configurable loss weights, optional BRDR pointwise adaptive residual weighting, `log_nu` optimization, seeded runs, seed sweeps, and reproducible benchmark artifacts
 
 ---
 
@@ -27,6 +33,7 @@ This project estimates the viscosity coefficient of the 1D viscous Burgers equat
 - [Usage](#usage)
 - [Results](#results)
 - [Current Status](#current-status)
+- [Limitations and Roadmap](#limitations-and-roadmap)
 - [References](#references)
 
 ---
@@ -45,7 +52,12 @@ where:
 - Initial condition: $u(x, 0) = \sin(2\pi x)$
 - Boundary conditions: periodic on $[0, 1]$
 
-Synthetic observations come from a differentiable pseudospectral Burgers solver with FFT spatial derivatives, 2/3 dealiasing, and adaptive Diffrax time integration. The solver uses the same sinusoidal initial condition and periodic boundary conditions as the PINN loss. The inverse pipeline samples noisy observations from the nonlinear solution field with additive Gaussian noise, using $\sigma = 0.02$ by default.
+Synthetic observations come from a differentiable pseudospectral Burgers solver
+with FFT spatial derivatives, 2/3 dealiasing, and adaptive Diffrax time
+integration. The solver uses the same sinusoidal initial condition and periodic
+boundary conditions as the PINN loss. The inverse pipeline samples noisy
+observations from the nonlinear solution field with additive Gaussian noise,
+using $\sigma = 0.02$ by default.
 
 A physics-informed neural network (PINN) minimizes a combined loss function:
 
@@ -73,7 +85,13 @@ MLP: 130 → 64 → 64 → 64 → 1 (tanh activations)
 Output: u(x, t)
 ```
 
-The Fourier frequencies are deterministic backend-independent constants. The flattened trainable parameter vector contains only MLP weights and biases, giving the JAX and PyTorch containers the same trainable-parameter contract. Derivatives ($\partial u/\partial x$, $\partial u/\partial t$, $\partial^2 u/\partial x^2$) are computed via automatic differentiation within each Tesseract using the native framework's autograd: `jax.grad` for the JAX backend and `torch.autograd.grad` for the PyTorch backend.
+The Fourier frequencies are deterministic backend-independent constants. The
+flattened trainable parameter vector contains only MLP weights and biases,
+giving the JAX and PyTorch containers the same trainable-parameter contract.
+Derivatives ($\partial u/\partial x$, $\partial u/\partial t$,
+$\partial^2 u/\partial x^2$) are computed via automatic differentiation within
+each Tesseract using the native framework's autograd: `jax.grad` for the JAX
+backend and `torch.autograd.grad` for the PyTorch backend.
 
 ### Tesseract Endpoints
 
@@ -82,7 +100,12 @@ The inverse-training showcase exercises these `pinn_jax` and `pinn_pytorch` endp
 1. **apply(inputs)**: Forward pass returning u_pred, u_x, u_t, u_xx
 2. **vector_jacobian_product(...)**: Reverse-mode AD for gradient computation
 
-JVP endpoints are secondary to the current demo because the inverse trainer uses reverse-mode gradients through `jax.grad`. The `burgers_solver` Tesseract implements the same `apply`, VJP, and JVP endpoint pattern for differentiable solver runs. In the current inverse-problem demo it is used offline to generate ground-truth observations; differentiating through the solver during optimization is a planned extension.
+JVP endpoints are secondary to the current demo because the inverse trainer uses
+reverse-mode gradients through `jax.value_and_grad`. The `burgers_solver`
+Tesseract implements the same `apply`, VJP, and JVP endpoint pattern for
+differentiable solver runs. In the current inverse-problem demo it is used
+offline to generate ground-truth observations and visualization fields;
+differentiating through the solver during optimization is a planned extension.
 
 Input/output schemas use Tesseract's `Differentiable[Array[...]]` annotations to declare which fields participate in autodiff.
 
@@ -104,21 +127,46 @@ loss, (log_nu_grad, params_grad) = loss_and_grads(log_nu, params, ..., pinn)
 # For JAX backend: Tesseract VJP internally uses jax.grad
 ```
 
-> **Key point:** The system-level gradients ($\partial \mathcal{L}/\partial \log\nu$ and $\partial \mathcal{L}/\partial \text{params}$) use Tesseract's `vector_jacobian_product` endpoint for both backends. The backend selection determines which autograd implementation Tesseract uses inside the VJP computation.
+> **Key point:** The system-level gradients
+> ($\partial \mathcal{L}/\partial \log\nu$ and
+> $\partial \mathcal{L}/\partial \text{params}$) use Tesseract's
+> `vector_jacobian_product` endpoint for both backends. The backend selection
+> determines which autograd implementation Tesseract uses inside the VJP
+> computation.
 
-The inverse loop optimizes `log_nu` and evaluates the PDE residual with `nu = exp(log_nu)`. This keeps the inferred viscosity positive without clipping the optimization variable.
+The inverse loop optimizes `log_nu` and evaluates the PDE residual with
+`nu = exp(log_nu)`. This keeps the inferred viscosity positive. Optional
+viscosity clipping and viscosity warmup are available through `TrainingConfig`
+and the Streamlit app for more stable interactive runs.
+
+### Shared Training Engine
+
+`inverse_problem.py` exposes `train_inverse(config, *, pinn=None, callback=None,
+metrics_every=20)`. Both the CLI and Streamlit UI call this function. Presentation
+is delegated to callbacks:
+
+- `RichProgressCallback` renders CLI progress and final tables.
+- `MetricsRecorderCallback` records per-epoch metrics for CLI artifacts.
+- `StreamlitTrainingCallback` drives the app's live plots and trace panels.
+
+Each optimization step uses one `jax.value_and_grad` over `(log_nu, params)`.
+`TesseractCallCounter` wraps the `tesseract_jax` dispatch layer to report real
+container calls; the current inverse step measures 5 `apply` calls and 5 VJP
+calls per gradient step.
 
 ### Configuration
 
-Run settings live in typed dataclasses in `configs.py`:
+Run settings live in validated typed dataclasses in `configs.py`:
 
 - `ProblemConfig`: true viscosity, initial viscosity, and domain
 - `DataConfig`: observation count, noise level, and seed
-- `TrainingConfig`: epochs, learning rates, and collocation/IC/BC sample counts
+- `TrainingConfig`: epochs, learning rates, collocation/IC/BC sample counts, BRDR settings, optional viscosity warmup, and optional viscosity clipping
 - `LossWeights`: data, physics, initial-condition, and boundary-condition weights
 - `RunConfig`: full run configuration consumed by `inverse_problem.py`
 
-The CLI still exposes the common knobs directly. Internally, `inverse_problem.py` converts CLI arguments into a `RunConfig`, so Streamlit or future scripts can call the same training path without duplicating defaults.
+The CLI exposes the common knobs directly. Internally, `inverse_problem.py`
+converts CLI arguments into a `RunConfig`, so Streamlit, tests, and figure
+scripts call the same training path without duplicating defaults.
 
 ### Project Structure
 
@@ -128,7 +176,11 @@ tesseract-pinn-inverse-burgers/
 ├── inverse_problem.py         # CLI demo comparing JAX/PyTorch backends
 ├── app.py                     # Streamlit interactive interface
 ├── buildall.sh                # Builds Docker containers for all Tesseracts
+├── Makefile                   # Common verification and demo commands
 ├── pyproject.toml
+├── scripts/
+│   └── regenerate_figures.py  # Rebuilds README figures from current training path
+├── tests/                     # Unit tests plus optional container smoke test
 └── tesseracts/
     ├── burgers_solver/
     │   ├── tesseract_api.py        # Differentiable pseudospectral Burgers solver
@@ -165,6 +217,9 @@ uv sync
 docker images | grep -E 'burgers_solver|pinn'
 ```
 
+`pyproject.toml` and `uv.lock` are the dependency source of truth. No separate
+`requirements.txt` is maintained.
+
 ---
 
 ## Usage
@@ -197,6 +252,13 @@ uv run python inverse_problem.py --backend jax --epochs 50 --seeds 0 1 2 3 4
 uv run python inverse_problem.py --backend both --epochs 100 --seed 123 --out runs
 ```
 
+When `--out` is set, the CLI writes artifacts under
+`runs/<timestamp>/<backend>/`:
+
+- `config.json`: JSON-serializable `RunConfig`
+- `metrics.csv`: per-epoch viscosity, loss, gradient norms, timings, and measured Tesseract call counts
+- `summary.json`: final scalar results and apply/VJP calls per step
+
 ### Streamlit
 
 ```bash
@@ -204,11 +266,12 @@ uv run streamlit run app.py
 ```
 
 The Streamlit app provides:
-- Adjustable hyperparameters (viscosity, noise, learning rate)
+- Adjustable hyperparameters, observation counts, collocation counts, loss weights, viscosity warmup, and optional viscosity clipping
 - Real-time training visualization
 - Optional BRDR adaptive loss weighting and component mean-weight plots
-- Gradient flow inspector (Tesseract API call statistics)
-- Solution comparison plots
+- Tesseract trace panel with measured apply/VJP call counts
+- Solution field plots against solver ground truth
+- Backend consistency report for JAX vs PyTorch runs
 
 The CLI is the reference path for dataclass configs and seeded runs. The Streamlit app follows the same solver-backed observation generation, `log_nu` optimization, and optional adaptive loss-weighting path for interactive runs.
 
@@ -222,8 +285,7 @@ make smoke
 ```
 
 `make smoke` runs the live container round-trip test and skips cleanly when the
-local Tesseract images have not been built. `pyproject.toml` is the dependency
-source of truth; no separate `requirements.txt` is maintained.
+local Tesseract images have not been built.
 
 ---
 
@@ -275,10 +337,19 @@ uv run python scripts/regenerate_figures.py --epochs 100 --seed 123 --nx 160 --n
 - The CLI and Streamlit app share `train_inverse`, a callback-driven training engine.
 - Each training step uses one `jax.value_and_grad` over `log_nu` and the flattened PINN parameters.
 - Tesseract apply/VJP counts are measured through the `tesseract_jax` dispatch layer.
-- The solver generates observations offline for training. End-to-end differentiation through the solver during inverse training remains future work.
 - Loss weights can be fixed manually or adapted with opt-in BRDR pointwise residual weighting.
 - The PINN backend can be JAX or PyTorch; Tesseract exposes both through the same `apply`/VJP/JVP interface.
 - The Streamlit app is aligned with the current solver-backed training path for interactive inspection.
+- Container smoke coverage verifies `Tesseract.from_image(...)` through `apply` and VJP when local images are available.
+- Reproducible benchmark artifacts and regenerated README figures are supported.
+
+## Limitations and Roadmap
+
+- **No end-to-end solver/PINN composition yet:** observations are generated by the solver before training. The differentiated objective does not yet compose both the solver Tesseract and the PINN Tesseract in one `jax.value_and_grad` call.
+- **Single scalar parameter inversion:** the current inverse target is viscosity `nu` only.
+- **No checkpointing or model saving:** trained parameters are returned in memory and used for plotting, but not persisted as model checkpoints.
+- **PINN model reconstruction per call:** containers reconstruct model structure from `params_flat` on each `apply`/VJP call.
+- **Posterior/UQ is future work:** ensembles, Laplace-style approximations, or conditional flow matching are natural next steps after the deterministic inverse workflow.
 
 ## References
 
