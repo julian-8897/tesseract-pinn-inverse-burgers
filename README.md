@@ -228,36 +228,46 @@ source of truth; no separate `requirements.txt` is maintained.
 ---
 
 ## Results
-The repository includes example figures from the PINN comparison workflow:
-<table align="center" cellpadding="12">
-  <tr>
-    <td align="center">
-      <img src="img/pinn_solution_comparison.png" alt="PINN solution comparison" width="900"/>
-      <div><em>PINN solution comparison (JAX vs PyTorch)</em></div>
-    </td>
-  </tr>
-</table>
-
-PINN $u(x,t)$ solution plots for both backends:
-<table align="center" cellpadding="12">
-  <tr>
-    <td align="center">
-      <img src="img/pinn_field_solution_jax.png" alt="PINN solution comparison" width="900"/>
-      <div><em>PINN vs Solver Ground Truth (JAX)</em></div>
-    </td>
-  </tr>
-</table>
+The repository includes regenerated figures from the current solver-backed
+workflow. These were produced with `scripts/regenerate_figures.py` using both
+PINN Tesseract backends, 100 training epochs, seed 123, and a 160 x 90
+visualization grid.
 
 <table align="center" cellpadding="12">
   <tr>
     <td align="center">
-      <img src="img/pinn_field_solution_pytorch.png" alt="PINN solution comparison" width="900"/>
-      <div><em>PINN vs Solver Ground Truth (PyTorch)</em></div>
+      <img src="img/pinn_solution_comparison.png" alt="Backend consistency dashboard comparing JAX and PyTorch PINN Tesseracts" width="900"/>
+      <div><em>Backend consistency dashboard: viscosity trajectory, objective loss, final estimates, backend spread, and measured apply/VJP calls.</em></div>
     </td>
   </tr>
 </table>
 
-Regenerate these figures before treating them as benchmark results for the latest CLI path. Recent changes moved observation generation to the Burgers solver, added `log_nu` optimization, and added seed sweeps.
+PINN $u(x,t)$ field reconstructions against the pseudospectral Burgers solver
+ground truth:
+
+<table align="center" cellpadding="12">
+  <tr>
+    <td align="center">
+      <img src="img/pinn_field_solution_jax.png" alt="JAX PINN field compared with Burgers solver ground truth and absolute error" width="900"/>
+      <div><em>JAX PINN reconstruction vs solver ground truth with shared field color scale and absolute error.</em></div>
+    </td>
+  </tr>
+</table>
+
+<table align="center" cellpadding="12">
+  <tr>
+    <td align="center">
+      <img src="img/pinn_field_solution_pytorch.png" alt="PyTorch PINN field compared with Burgers solver ground truth and absolute error" width="900"/>
+      <div><em>PyTorch PINN reconstruction vs solver ground truth through the same JAX/Optax outer loop.</em></div>
+    </td>
+  </tr>
+</table>
+
+To regenerate these figures after training-path changes:
+
+```bash
+uv run python scripts/regenerate_figures.py --epochs 100 --seed 123 --nx 160 --nt 90
+```
 
 ## Current Status
 
