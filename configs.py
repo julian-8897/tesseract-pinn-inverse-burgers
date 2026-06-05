@@ -6,6 +6,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from math import isfinite
 
+# Default Gaussian sensor-noise standard deviation. Single source of truth shared
+# by the deterministic observation samplers and the FMPE simulator so the two paths
+# never silently disagree.
+DEFAULT_NOISE_STD = 0.02
+
 
 def _check_positive(name, value):
     value = float(value)
@@ -60,7 +65,7 @@ class DataConfig:
     """Observation-generation configuration."""
 
     n_obs: int = 80
-    noise_std: float = 0.02
+    noise_std: float = DEFAULT_NOISE_STD
     seed: int = 123
 
     def __post_init__(self):

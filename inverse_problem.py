@@ -38,6 +38,7 @@ from tesseract_jax import apply_tesseract
 
 from configs import (
     DEFAULT_LOSS_WEIGHTS,
+    DEFAULT_NOISE_STD,
     LOSS_WEIGHT_NAMES,
     LossWeights,
     RunConfig,
@@ -47,6 +48,15 @@ from configs import (
 
 REPO_ROOT = Path(__file__).resolve().parent
 CONSOLE = Console()
+
+# Solver discretization grid. Shared by the forward solver, the observation
+# samplers, and the FMPE sensor layout — named generically rather than after any
+# one experiment so cross-module imports read honestly.
+SOLVER_NX = 128
+SOLVER_NT = 64
+# Smallest observation/collocation time. Sensors and collocation points avoid
+# t≈0, where the initial condition dominates and the inverse signal is weak.
+MIN_OBS_TIME = 0.05
 
 
 def format_loss_weights(loss_weights):
@@ -382,15 +392,17 @@ def get_initial_params(backend="jax", seed=42):
             sys.modules["tesseract_api"] = previous_module
 
 
-def generate_observations(n_points, true_viscosity, domain, key, noise_std=0.02):
+def generate_observations(
+    n_points, true_viscosity, domain, key, noise_std=DEFAULT_NOISE_STD
+):
     """
     Generate synthetic observations from the pseudospectral Burgers solver.
 
     The solver uses the same sinusoidal initial condition assumed by the PINN
     initial-condition loss: u(x, 0) = sin(2πx).
     """
-    nx = 128
-    nt = 64
+    nx = SOLVER_NX
+    nt = SOLVER_NT
     keys = jax.random.split(key, 3)
 
     x_grid = jnp.linspace(
@@ -408,7 +420,7 @@ def generate_observations(n_points, true_viscosity, domain, key, noise_std=0.02)
     )
 
     x_idx = jax.random.randint(keys[0], (n_points,), minval=0, maxval=nx)
-    min_t_idx = max(1, int(jnp.searchsorted(t_grid, 0.05, side="left")))
+    min_t_idx = max(1, int(jnp.searchsorted(t_grid, MIN_OBS_TIME, side="left")))
     t_idx = jax.random.randint(keys[1], (n_points,), minval=min_t_idx, maxval=nt)
 
     x = x_grid[x_idx]
@@ -437,8 +449,6 @@ _KDV_DT0 = 1e-3
 _KDV_RTOL = 1e-6
 _KDV_ATOL = 1e-6
 _KDV_MAX_STEPS = 200_000
-_HYBRID_NX = 128
-_HYBRID_NT = 64
 
 
 def _kdv_burgers_rhs(u, nu, beta, x_grid):
@@ -513,12 +523,14 @@ def _sample_grid_indices(key, n_points, x_grid, t_grid):
     keys = jax.random.split(key, 2)
     nx, nt = x_grid.shape[0], t_grid.shape[0]
     x_idx = jax.random.randint(keys[0], (n_points,), minval=0, maxval=nx)
-    min_t_idx = max(1, int(jnp.searchsorted(t_grid, 0.05, side="left")))
+    min_t_idx = max(1, int(jnp.searchsorted(t_grid, MIN_OBS_TIME, side="left")))
     t_idx = jax.random.randint(keys[1], (n_points,), minval=min_t_idx, maxval=nt)
     return x_idx, t_idx
 
 
-def generate_grid_observations(n_points, true_viscosity, domain, key, noise_std=0.02):
+def generate_grid_observations(
+    n_points, true_viscosity, domain, key, noise_std=DEFAULT_NOISE_STD
+):
     """Sparse noisy observations from the in-loop viscous-Burgers solver itself.
 
     The truth here is the *same* physics the ``solver-inverse`` mode optimizes
@@ -527,7 +539,7 @@ def generate_grid_observations(n_points, true_viscosity, domain, key, noise_std=
     sampled `(t_idx, x_idx)` so the in-loop solver field can be gathered at the same
     nodes inside the differentiated objective.
     """
-    nx, nt = _HYBRID_NX, _HYBRID_NT
+    nx, nt = SOLVER_NX, SOLVER_NT
     key_idx, key_noise = jax.random.split(key, 2)
 
     x_grid = jnp.linspace(
@@ -559,7 +571,7 @@ def generate_grid_observations(n_points, true_viscosity, domain, key, noise_std=
 
 
 def generate_kdv_observations(
-    n_points, true_viscosity, dispersion_beta, domain, key, noise_std=0.02
+    n_points, true_viscosity, dispersion_beta, domain, key, noise_std=DEFAULT_NOISE_STD
 ):
     """Sample sparse noisy observations from the KdV-Burgers truth at grid nodes.
 
@@ -568,7 +580,7 @@ def generate_kdv_observations(
     also returns the grid and the sampled `(t_idx, x_idx)` so the in-loop solver
     field can be gathered at the same nodes inside the differentiated objective.
     """
-    nx, nt = _HYBRID_NX, _HYBRID_NT
+    nx, nt = SOLVER_NX, SOLVER_NT
     key_idx, key_noise = jax.random.split(key, 2)
 
     x_grid = jnp.linspace(
@@ -950,13 +962,13 @@ def build_training_inputs(config):
         key_col_x, (training.n_col,), minval=domain["x"][0], maxval=domain["x"][1]
     )
     t_col = jax.random.uniform(
-        key_col_t, (training.n_col,), minval=0.05, maxval=domain["t"][1]
+        key_col_t, (training.n_col,), minval=MIN_OBS_TIME, maxval=domain["t"][1]
     )
     x_ic = jax.random.uniform(
         key_ic, (training.n_ic,), minval=domain["x"][0], maxval=domain["x"][1]
     )
     t_bc = jax.random.uniform(
-        key_bc, (training.n_bc,), minval=0.05, maxval=domain["t"][1]
+        key_bc, (training.n_bc,), minval=MIN_OBS_TIME, maxval=domain["t"][1]
     )
     return x_obs, t_obs, u_obs, x_col, t_col, x_ic, t_bc
 
@@ -1234,11 +1246,13 @@ def train_inverse(config, *, pinn=None, callback=None, metrics_every=20):
 #
 
 
-def _solver_field(solver, nu, x_grid, t_grid):
-    """Run the in-loop viscous-Burgers solver Tesseract at the current `nu`.
+def _solver_field(solver, nu, x_grid, t_grid, ic_amp=1.0, ic_phase=0.0):
+    """Run the in-loop viscous-Burgers solver Tesseract at the current parameters.
 
-    Differentiating the loss w.r.t. `nu` triggers this Tesseract's VJP endpoint.
-    `ic_amp`/`ic_phase` are passed as constants for Stage 1 (multi-parameter later).
+    Differentiating the loss w.r.t. any of ``nu``/``ic_amp``/``ic_phase`` triggers
+    this Tesseract's VJP endpoint, so all three may be passed as traced values (e.g.
+    Stage-C multi-parameter refinement). They default to the canonical
+    ``u(x, 0) = sin(2πx)`` initial condition used by the single-parameter modes.
     """
     return apply_tesseract(
         solver,
@@ -1246,8 +1260,8 @@ def _solver_field(solver, nu, x_grid, t_grid):
             "nu": nu,
             "x_grid": x_grid,
             "t_grid": t_grid,
-            "ic_amp": jnp.asarray(1.0, dtype=jnp.float32),
-            "ic_phase": jnp.asarray(0.0, dtype=jnp.float32),
+            "ic_amp": jnp.asarray(ic_amp, dtype=jnp.float32),
+            "ic_phase": jnp.asarray(ic_phase, dtype=jnp.float32),
         },
     )["u_field"]
 
@@ -1337,7 +1351,7 @@ def train_hybrid_inverse(
         key_reg_x, (training.n_col,), minval=domain["x"][0], maxval=domain["x"][1]
     )
     t_reg = jax.random.uniform(
-        key_reg_t, (training.n_col,), minval=0.05, maxval=domain["t"][1]
+        key_reg_t, (training.n_col,), minval=MIN_OBS_TIME, maxval=domain["t"][1]
     )
 
     pinn_image = image_name_for_backend(backend)

@@ -24,7 +24,13 @@ import torch
 from sbi.inference import FMPE
 from sbi.utils import BoxUniform
 
-from inverse_problem import _HYBRID_NT, _HYBRID_NX, get_burgers_solver
+from configs import DEFAULT_NOISE_STD
+from inverse_problem import (
+    MIN_OBS_TIME,
+    SOLVER_NT,
+    SOLVER_NX,
+    get_burgers_solver,
+)
 
 # theta = (nu, ic_amp, ic_phase)
 PARAM_NAMES = ("nu", "ic_amp", "ic_phase")
@@ -48,18 +54,20 @@ class Sensors:
     def __init__(self, n_sensors: int = 64, seed: int = 0, x_idx=None, t_idx=None):
         domain_x, domain_t = (0.0, 1.0), (0.0, 1.0)
         self.x_grid = jnp.linspace(
-            *domain_x, _HYBRID_NX, endpoint=False, dtype=jnp.float32
+            *domain_x, SOLVER_NX, endpoint=False, dtype=jnp.float32
         )
-        self.t_grid = jnp.linspace(*domain_t, _HYBRID_NT, dtype=jnp.float32)
+        self.t_grid = jnp.linspace(*domain_t, SOLVER_NT, dtype=jnp.float32)
         if x_idx is not None and t_idx is not None:
             self.x_idx = jnp.asarray(x_idx)
             self.t_idx = jnp.asarray(t_idx)
         else:
             key = jax.random.PRNGKey(seed)
             kx, kt = jax.random.split(key, 2)
-            self.x_idx = jax.random.randint(kx, (n_sensors,), 0, _HYBRID_NX)
-            min_t = max(1, int(jnp.searchsorted(self.t_grid, 0.05, side="left")))
-            self.t_idx = jax.random.randint(kt, (n_sensors,), min_t, _HYBRID_NT)
+            self.x_idx = jax.random.randint(kx, (n_sensors,), 0, SOLVER_NX)
+            min_t = max(
+                1, int(jnp.searchsorted(self.t_grid, MIN_OBS_TIME, side="left"))
+            )
+            self.t_idx = jax.random.randint(kt, (n_sensors,), min_t, SOLVER_NT)
         self.n_sensors = int(self.x_idx.shape[0])
 
     @classmethod
@@ -84,7 +92,7 @@ _simulate_chunk_jit = jax.jit(_simulate_chunk)
 def simulate(
     theta: torch.Tensor,
     sensors: Sensors,
-    noise_std: float = 0.02,
+    noise_std: float = DEFAULT_NOISE_STD,
     seed: int = 0,
     chunk: int = 256,
 ) -> torch.Tensor:
@@ -119,7 +127,7 @@ def simulate(
 def train_fmpe(
     n_sims: int = 4000,
     n_sensors: int = 64,
-    noise_std: float = 0.02,
+    noise_std: float = DEFAULT_NOISE_STD,
     sim_seed: int = 0,
     prior: BoxUniform | None = None,
     device: str = "cpu",
@@ -156,7 +164,7 @@ def train_fmpe(
 
 
 def observation_from_theta(
-    theta_true, sensors: Sensors, noise_std: float = 0.02, seed: int = 1234
+    theta_true, sensors: Sensors, noise_std: float = DEFAULT_NOISE_STD, seed: int = 1234
 ) -> torch.Tensor:
     """Build a single noisy observation vector ``x_o`` from a known parameter set."""
     theta = torch.tensor([list(theta_true)], dtype=torch.float32)

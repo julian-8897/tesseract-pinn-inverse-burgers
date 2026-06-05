@@ -30,10 +30,10 @@ def test_grid_observations_shapes_and_consistency():
     assert obs.x_obs.shape == (50,)
     assert obs.t_obs.shape == (50,)
     assert obs.u_obs.shape == (50,)
-    assert obs.x_grid.shape == (ip._HYBRID_NX,)
-    assert obs.t_grid.shape == (ip._HYBRID_NT,)
+    assert obs.x_grid.shape == (ip.SOLVER_NX,)
+    assert obs.t_grid.shape == (ip.SOLVER_NT,)
     # Indices index into the grid, and the time floor (t >= 0.05) is respected.
-    assert jnp.all(obs.x_idx < ip._HYBRID_NX)
+    assert jnp.all(obs.x_idx < ip.SOLVER_NX)
     assert jnp.all(obs.t_grid[obs.t_idx] >= 0.05 - 1e-6)
     assert jnp.all(jnp.isfinite(obs.u_obs))
     # Sampled coordinates correspond to their indices.

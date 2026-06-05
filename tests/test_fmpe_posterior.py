@@ -32,7 +32,7 @@ def test_sensor_layout():
     assert sensors.n_sensors == 48
     assert sensors.x_idx.shape == (48,)
     assert sensors.t_idx.shape == (48,)
-    assert int(sensors.x_idx.max()) < fp._HYBRID_NX
+    assert int(sensors.x_idx.max()) < fp.SOLVER_NX
     # Time floor t >= 0.05 respected.
     assert float(sensors.t_grid[sensors.t_idx].min()) >= 0.05 - 1e-6
 
