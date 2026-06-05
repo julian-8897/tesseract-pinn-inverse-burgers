@@ -31,10 +31,18 @@ class ProblemConfig:
     initial_viscosity: float = 0.01
     domain_x: tuple[float, float] = (0.0, 1.0)
     domain_t: tuple[float, float] = (0.0, 1.0)
+    # Dispersion coefficient of the KdV-Burgers truth (`-beta u_xxx`). This is the
+    # un-modeled physics the in-loop viscous-Burgers solver omits; the hybrid
+    # discrepancy term learns its effect. beta=0 reduces the truth to plain
+    # viscous Burgers (discrepancy collapses to zero — useful as a sanity check).
+    dispersion_beta: float = 1e-3
 
     def __post_init__(self):
         _check_positive("true_viscosity", self.true_viscosity)
         _check_positive("initial_viscosity", self.initial_viscosity)
+        beta = float(self.dispersion_beta)
+        if not isfinite(beta) or beta < 0:
+            raise ValueError("dispersion_beta must be a finite non-negative value")
         for name, bounds in (("domain_x", self.domain_x), ("domain_t", self.domain_t)):
             lo, hi = float(bounds[0]), float(bounds[1])
             if not (isfinite(lo) and isfinite(hi)):
@@ -82,6 +90,11 @@ class TrainingConfig:
     clip_log_viscosity: bool = False
     nu_clip_min: float = 1e-4
     nu_clip_max: float = 0.5
+    # Hybrid-mode discrepancy regularization (Stage 1). The L2 weight keeps the
+    # learned discrepancy small so the physical viscosity stays identifiable; the
+    # optional smoothness weight penalizes the discrepancy's spatial gradient.
+    discrepancy_reg_weight: float = 1.0
+    discrepancy_smooth_weight: float = 0.0
 
     def __post_init__(self):
         if int(self.n_epochs) <= 0:
@@ -94,6 +107,10 @@ class TrainingConfig:
         for name in ("n_col", "n_ic", "n_bc"):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        for name in ("discrepancy_reg_weight", "discrepancy_smooth_weight"):
+            value = float(getattr(self, name))
+            if not isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite non-negative value")
         if int(self.viscosity_warmup_epochs) < 0:
             raise ValueError("viscosity_warmup_epochs must be non-negative")
         if self.clip_log_viscosity:

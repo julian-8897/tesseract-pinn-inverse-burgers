@@ -1,4 +1,4 @@
-# Backend-Agnostic Inverse Burgers PINN with Tesseract
+1# Backend-Agnostic Inverse Burgers with Tesseract
 
 [![tesseract-core v1.2.0](https://img.shields.io/badge/tesseract--core-v1.2.0-blue)](https://github.com/pasteurlabs/tesseract-core)
 [![tesseract-jax v0.2.3](https://img.shields.io/badge/tesseract--jax-v0.2.3-green)](https://github.com/pasteurlabs/tesseract-jax)
@@ -9,18 +9,30 @@
 
 **Overview**
 This project estimates the viscosity coefficient of the 1D viscous Burgers
-equation from noisy observations. The inverse solver uses a physics-informed
-neural network (PINN) exposed as a Tesseract, with interchangeable JAX and
-PyTorch backends. The outer optimization loop stays in JAX/Optax for both
-backends; when the PyTorch backend runs, Tesseract routes `jax.value_and_grad`
-through the PyTorch VJP endpoint.
+equation from sparse noisy observations, and showcases **Tesseract as a registry
+of framework-agnostic, swappable, differentiable model components**. The physics
+solver, the PINN surrogate, and (next) the posterior sampler are each packaged as
+an independent Tesseract behind one uniform typed schema — so you swap a JAX
+component for a PyTorch one by changing an image name, with identical calling
+code and no shared environment.
+
+The inverse problem is solved two ways, both differentiating through a Tesseract:
+
+- **Solver-adjoint inversion** (`--mode solver-inverse`): `jax.grad` flows through
+  the differentiable **solver** Tesseract's VJP — a PDE-constrained baseline.
+- **PINN inversion** (`--mode pinn`): `jax.grad` flows through the **PINN**
+  Tesseract's VJP, with the PINN backend interchangeable between **JAX and
+  PyTorch** (the backend-agnostic showcase).
+
+`--mode compare` runs all three (solver-adjoint, PINN-JAX, PINN-PyTorch) on the
+same physics and prints a unified table.
 
 **Key implementations:**
-- JAX and PyTorch PINN Tesseracts with a shared `apply`/`vector_jacobian_product` inverse-training contract
-- Differentiable pseudospectral Burgers solver Tesseract for solver-generated observations
-- Shared `train_inverse(...)` engine used by both the CLI and Streamlit app
-- Measured Tesseract apply/VJP telemetry for each gradient step
-- Configurable loss weights, optional BRDR pointwise adaptive residual weighting, `log_nu` optimization, seeded runs, seed sweeps, and reproducible benchmark artifacts
+- Three swappable, framework-agnostic Tesseracts: a JAX pseudospectral **solver**, and a **PINN** with interchangeable JAX/PyTorch backends behind one `apply`/`vector_jacobian_product` contract
+- Two differentiable inverse methods (solver-adjoint and PINN) compared on identical physics
+- Shared callback-driven training engines; measured Tesseract apply/VJP telemetry per gradient step
+- Configurable loss weights, optional BRDR adaptive residual weighting, `log_nu` optimization, seeded runs, seed sweeps, reproducible artifacts
+- Roadmap: amortized flow-matching posterior over `nu` for calibrated uncertainty (see `INVERSE_FMPE_PLAN.md`)
 
 ---
 
@@ -227,10 +239,16 @@ docker images | grep -E 'burgers_solver|pinn'
 ### CLI
 
 ```bash
-# Compare both backends
+# Compare inverse methods: solver-adjoint vs PINN (JAX & PyTorch), one table
+uv run python inverse_problem.py --mode compare --epochs 100 --seed 123
+
+# Solver-adjoint inversion (jax.grad through the solver Tesseract VJP)
+uv run python inverse_problem.py --mode solver-inverse --epochs 80
+
+# PINN inversion: compare both backends
 uv run python inverse_problem.py --backend both --epochs 100
 
-# Single backend
+# PINN inversion: single backend
 uv run python inverse_problem.py --backend jax --epochs 50
 uv run python inverse_problem.py --backend pytorch --epochs 50
 
@@ -333,23 +351,18 @@ uv run python scripts/regenerate_figures.py --epochs 100 --seed 123 --nx 160 --n
 
 ## Current Status
 
-- The CLI inverse pipeline uses solver-generated noisy Burgers observations.
-- The CLI and Streamlit app share `train_inverse`, a callback-driven training engine.
-- Each training step uses one `jax.value_and_grad` over `log_nu` and the flattened PINN parameters.
-- Tesseract apply/VJP counts are measured through the `tesseract_jax` dispatch layer.
-- Loss weights can be fixed manually or adapted with opt-in BRDR pointwise residual weighting.
-- The PINN backend can be JAX or PyTorch; Tesseract exposes both through the same `apply`/VJP/JVP interface.
-- The Streamlit app is aligned with the current solver-backed training path for interactive inspection.
-- Container smoke coverage verifies `Tesseract.from_image(...)` through `apply` and VJP when local images are available.
-- Reproducible benchmark artifacts and regenerated README figures are supported.
+- Two differentiable inverse methods: **solver-adjoint** (`--mode solver-inverse`, `jax.grad` through the solver VJP) and **PINN** (`--mode pinn`, `jax.grad` through the PINN VJP); `--mode compare` tabulates both.
+- For scalar viscosity inversion the solver-adjoint method is dramatically more accurate and cheaper per step than the PINN; the PINN is mesh-free and needs no solver but converges more slowly. The two PINN backends (JAX, PyTorch) agree, demonstrating backend-agnostic consistency.
+- Each step uses one `jax.value_and_grad`; Tesseract apply/VJP counts are measured through the `tesseract_jax` dispatch layer.
+- Loss weights can be fixed or adapted with opt-in BRDR pointwise residual weighting; the CLI and Streamlit app share callback-driven training engines.
+- Container smoke coverage verifies `Tesseract.from_image(...)` through `apply` and VJP when local images are available; reproducible artifacts and figures are supported.
 
 ## Limitations and Roadmap
 
-- **No end-to-end solver/PINN composition yet:** observations are generated by the solver before training. The differentiated objective does not yet compose both the solver Tesseract and the PINN Tesseract in one `jax.value_and_grad` call.
-- **Single scalar parameter inversion:** the current inverse target is viscosity `nu` only.
-- **No checkpointing or model saving:** trained parameters are returned in memory and used for plotting, but not persisted as model checkpoints.
-- **PINN model reconstruction per call:** containers reconstruct model structure from `params_flat` on each `apply`/VJP call.
-- **Posterior/UQ is future work:** ensembles, Laplace-style approximations, or conditional flow matching are natural next steps after the deterministic inverse workflow.
+- **Frontier UQ (next):** an amortized **flow-matching posterior** over `nu` (a third swappable Tesseract) for calibrated uncertainty, validated with simulation-based calibration / coverage. See `INVERSE_FMPE_PLAN.md`.
+- **Single scalar parameter inversion:** the inverse target is viscosity `nu` only; joint inference of initial-condition parameters is a natural extension.
+- **Model-misspecification sidebar (experimental):** a KdV-Burgers truth oracle (`solve_kdv_burgers`) plus a learned-discrepancy hybrid (`train_hybrid_inverse`) are included to *demonstrate* a known failure mode — naive calibration-with-discrepancy is confounded with the calibration parameter and biases it (Brynjarsdóttir & O'Hagan, 2014). This is documented as a limitation, not a headline result, and motivates the posterior treatment above.
+- **No checkpointing; PINN model reconstructed from `params_flat` per call.**
 
 ## References
 

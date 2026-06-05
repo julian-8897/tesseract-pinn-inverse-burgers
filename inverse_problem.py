@@ -17,7 +17,9 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from statistics import fmean, pstdev
+from typing import NamedTuple
 
+import diffrax
 import jax
 import jax.numpy as jnp
 import optax
@@ -418,6 +420,176 @@ def generate_observations(n_points, true_viscosity, domain, key, noise_std=0.02)
     u_observed = u_observed + noise
 
     return x, t, u_observed
+
+
+#
+# Hybrid Stage 1: KdV-Burgers truth oracle + discrepancy calibration
+#
+# The in-loop simulator (the `burgers_solver` Tesseract) solves plain viscous
+# Burgers. The *truth* is generated here from the structurally richer KdV-Burgers
+# equation `u_t + u u_x = nu u_xx - beta u_xxx`. The dispersive `-beta u_xxx` term
+# is outside the simulator's reachable family for any `nu`, so the discrepancy the
+# PINN learns is irreducible (there is genuinely something to correct). This oracle
+# is a local JAX function, not a Tesseract, because it is never differentiated.
+#
+
+_KDV_DT0 = 1e-3
+_KDV_RTOL = 1e-6
+_KDV_ATOL = 1e-6
+_KDV_MAX_STEPS = 200_000
+_HYBRID_NX = 128
+_HYBRID_NT = 64
+
+
+def _kdv_burgers_rhs(u, nu, beta, x_grid):
+    """Spectral RHS for KdV-Burgers: -u u_x + nu u_xx - beta u_xxx (dealiased)."""
+    nx = u.shape[0]
+    dx = x_grid[1] - x_grid[0]
+    k = 2.0 * jnp.pi * jnp.fft.fftfreq(nx) / dx
+    u_hat = jnp.fft.fft(u)
+    u_x = jnp.fft.ifft(1j * k * u_hat).real
+    u_xx = jnp.fft.ifft(-(k**2) * u_hat).real
+    u_xxx = jnp.fft.ifft(-1j * (k**3) * u_hat).real  # (i k)^3 = -i k^3
+
+    # 2/3-rule dealiasing of the nonlinear product, matching the solver Tesseract.
+    mode_numbers = jnp.fft.fftfreq(nx) * nx
+    keep = jnp.abs(mode_numbers) <= (nx // 3)
+    nonlinear = jnp.fft.ifft(jnp.fft.fft(u * u_x) * keep).real
+
+    return -nonlinear + nu * u_xx - beta * u_xxx
+
+
+def solve_kdv_burgers(nu, beta, x_grid, t_grid, ic_amp=1.0, ic_phase=0.0):
+    """High-fidelity KdV-Burgers truth oracle.
+
+    Solves `u_t + u u_x = nu u_xx - beta u_xxx` spectrally with the same periodic
+    sinusoidal IC and dealiasing as the in-loop `burgers_solver` Tesseract, plus the
+    extra dispersive term the simulator omits. With ``beta == 0`` it reproduces the
+    plain viscous-Burgers field (discrepancy collapses to zero).
+    """
+    nu = jnp.asarray(nu, dtype=jnp.float32)
+    beta = jnp.asarray(beta, dtype=jnp.float32)
+    x_grid = jnp.asarray(x_grid, dtype=jnp.float32)
+    t_grid = jnp.asarray(t_grid, dtype=jnp.float32)
+    u0 = jnp.asarray(ic_amp, dtype=jnp.float32) * jnp.sin(
+        2.0 * jnp.pi * x_grid + jnp.asarray(ic_phase, dtype=jnp.float32)
+    )
+
+    def vector_field(_, u, args):
+        nu_value, beta_value, grid = args
+        return _kdv_burgers_rhs(u, nu_value, beta_value, grid)
+
+    sol = diffrax.diffeqsolve(
+        diffrax.ODETerm(vector_field),
+        diffrax.Tsit5(),
+        t0=t_grid[0],
+        t1=t_grid[-1],
+        dt0=_KDV_DT0,
+        y0=u0,
+        args=(nu, beta, x_grid),
+        saveat=diffrax.SaveAt(ts=t_grid),
+        stepsize_controller=diffrax.PIDController(rtol=_KDV_RTOL, atol=_KDV_ATOL),
+        max_steps=_KDV_MAX_STEPS,
+    )
+    return sol.ys
+
+
+class GridObservations(NamedTuple):
+    """Sparse observations plus the grid/indices the in-loop solver field is
+    gathered at. Shared by ``--mode solver-inverse`` (clean Burgers truth) and the
+    experimental KdV discrepancy sidebar."""
+
+    x_obs: jax.Array
+    t_obs: jax.Array
+    u_obs: jax.Array
+    x_grid: jax.Array
+    t_grid: jax.Array
+    x_idx: jax.Array
+    t_idx: jax.Array
+
+
+def _sample_grid_indices(key, n_points, x_grid, t_grid):
+    """Sample sparse grid-node indices, with a small time floor (t >= 0.05)."""
+    keys = jax.random.split(key, 2)
+    nx, nt = x_grid.shape[0], t_grid.shape[0]
+    x_idx = jax.random.randint(keys[0], (n_points,), minval=0, maxval=nx)
+    min_t_idx = max(1, int(jnp.searchsorted(t_grid, 0.05, side="left")))
+    t_idx = jax.random.randint(keys[1], (n_points,), minval=min_t_idx, maxval=nt)
+    return x_idx, t_idx
+
+
+def generate_grid_observations(n_points, true_viscosity, domain, key, noise_std=0.02):
+    """Sparse noisy observations from the in-loop viscous-Burgers solver itself.
+
+    The truth here is the *same* physics the ``solver-inverse`` mode optimizes
+    against (plain viscous Burgers), so the inverse problem is well-posed and the
+    solver-adjoint estimate recovers ``nu`` up to noise. Returns the grid and the
+    sampled `(t_idx, x_idx)` so the in-loop solver field can be gathered at the same
+    nodes inside the differentiated objective.
+    """
+    nx, nt = _HYBRID_NX, _HYBRID_NT
+    key_idx, key_noise = jax.random.split(key, 2)
+
+    x_grid = jnp.linspace(
+        domain["x"][0], domain["x"][1], nx, endpoint=False, dtype=jnp.float32
+    )
+    t_grid = jnp.linspace(domain["t"][0], domain["t"][1], nt, dtype=jnp.float32)
+
+    solve_burgers = get_burgers_solver()
+    u_field = solve_burgers(
+        jnp.asarray(true_viscosity, dtype=jnp.float32),
+        x_grid,
+        t_grid,
+        jnp.array(1.0, dtype=jnp.float32),
+        jnp.array(0.0, dtype=jnp.float32),
+    )
+
+    x_idx, t_idx = _sample_grid_indices(key_idx, n_points, x_grid, t_grid)
+    noise = jax.random.normal(key_noise, (n_points,)) * noise_std
+
+    return GridObservations(
+        x_obs=x_grid[x_idx],
+        t_obs=t_grid[t_idx],
+        u_obs=u_field[t_idx, x_idx] + noise,
+        x_grid=x_grid,
+        t_grid=t_grid,
+        x_idx=x_idx,
+        t_idx=t_idx,
+    )
+
+
+def generate_kdv_observations(
+    n_points, true_viscosity, dispersion_beta, domain, key, noise_std=0.02
+):
+    """Sample sparse noisy observations from the KdV-Burgers truth at grid nodes.
+
+    Mirrors :func:`generate_observations`' grid, RNG split, time floor, and noise
+    model so the hybrid mode's data is directly comparable to the other modes, but
+    also returns the grid and the sampled `(t_idx, x_idx)` so the in-loop solver
+    field can be gathered at the same nodes inside the differentiated objective.
+    """
+    nx, nt = _HYBRID_NX, _HYBRID_NT
+    key_idx, key_noise = jax.random.split(key, 2)
+
+    x_grid = jnp.linspace(
+        domain["x"][0], domain["x"][1], nx, endpoint=False, dtype=jnp.float32
+    )
+    t_grid = jnp.linspace(domain["t"][0], domain["t"][1], nt, dtype=jnp.float32)
+
+    u_field = solve_kdv_burgers(true_viscosity, dispersion_beta, x_grid, t_grid)
+
+    x_idx, t_idx = _sample_grid_indices(key_idx, n_points, x_grid, t_grid)
+    noise = jax.random.normal(key_noise, (n_points,)) * noise_std
+
+    return GridObservations(
+        x_obs=x_grid[x_idx],
+        t_obs=t_grid[t_idx],
+        u_obs=u_field[t_idx, x_idx] + noise,
+        x_grid=x_grid,
+        t_grid=t_grid,
+        x_idx=x_idx,
+        t_idx=t_idx,
+    )
 
 
 def compute_pointwise_losses(
@@ -1057,6 +1229,520 @@ def train_inverse(config, *, pinn=None, callback=None, metrics_every=20):
     return result
 
 
+#
+# Hybrid Stage 1: composed solver + discrepancy objective and training engine
+#
+
+
+def _solver_field(solver, nu, x_grid, t_grid):
+    """Run the in-loop viscous-Burgers solver Tesseract at the current `nu`.
+
+    Differentiating the loss w.r.t. `nu` triggers this Tesseract's VJP endpoint.
+    `ic_amp`/`ic_phase` are passed as constants for Stage 1 (multi-parameter later).
+    """
+    return apply_tesseract(
+        solver,
+        {
+            "nu": nu,
+            "x_grid": x_grid,
+            "t_grid": t_grid,
+            "ic_amp": jnp.asarray(1.0, dtype=jnp.float32),
+            "ic_phase": jnp.asarray(0.0, dtype=jnp.float32),
+        },
+    )["u_field"]
+
+
+def hybrid_discrepancy_loss(
+    log_viscosity,
+    params_flat,
+    obs,
+    x_reg,
+    t_reg,
+    solver,
+    pinn,
+    w_data,
+    w_reg,
+    w_smooth,
+):
+    """Composed hybrid objective `u_model = solver(nu) + delta`.
+
+    - Data term fits `solver(nu)[obs] + delta(obs)` to the sparse KdV observations.
+    - L2 (and optional smoothness) regularization keeps `delta` small so `nu` stays
+      identifiable.
+
+    Reverse-mode differentiation composes two Tesseract VJPs in one pass:
+    `dL/d(log nu)` through the JAX solver, `dL/d(params)` through the discrepancy
+    network (JAX or PyTorch). Returns `(total, components)` for `has_aux`.
+    """
+    nu = jnp.exp(log_viscosity)
+
+    u_field = _solver_field(solver, nu, obs.x_grid, obs.t_grid)
+    u_solver_obs = u_field[obs.t_idx, obs.x_idx]
+    delta_obs = apply_tesseract(
+        pinn, {"x": obs.x_obs, "t": obs.t_obs, "params_flat": params_flat}
+    )["u_pred"]
+    u_model = u_solver_obs + delta_obs
+    data_loss = jnp.mean((u_model - obs.u_obs) ** 2)
+
+    reg_out = apply_tesseract(
+        pinn, {"x": x_reg, "t": t_reg, "params_flat": params_flat}
+    )
+    reg_loss = jnp.mean(reg_out["u_pred"] ** 2)
+    smooth_loss = jnp.mean(reg_out["u_x"] ** 2)
+
+    total = w_data * data_loss + w_reg * reg_loss + w_smooth * smooth_loss
+    components = {
+        "total": total,
+        "data": data_loss,
+        "reg": reg_loss,
+        "smooth": smooth_loss,
+    }
+    return total, components
+
+
+def train_hybrid_inverse(
+    config, *, solver=None, pinn=None, callback=None, metrics_every=20
+):
+    """Run the hybrid calibration-with-discrepancy loop (Stage 1).
+
+    Jointly optimizes `log_nu` and the discrepancy network parameters with one
+    reverse-mode `value_and_grad` over both, composing the solver and discrepancy
+    Tesseract VJPs each step. The solver (JAX) is opened from `burgers_solver`; the
+    discrepancy network from `pinn_{backend}` (JAX or PyTorch). Presentation is
+    delegated to `callback`.
+    """
+    backend = config.backend
+    problem = config.problem
+    data_config = config.data
+    training = config.training
+    w_data = float(config.loss.data)
+    w_reg = float(training.discrepancy_reg_weight)
+    w_smooth = float(training.discrepancy_smooth_weight)
+
+    callback = callback or TrainingCallback()
+    counter = TesseractCallCounter()
+
+    domain = problem.domain
+    key = jax.random.PRNGKey(data_config.seed)
+    key_obs, key_reg_x, key_reg_t = jax.random.split(key, 3)
+    obs = generate_kdv_observations(
+        data_config.n_obs,
+        problem.true_viscosity,
+        problem.dispersion_beta,
+        domain,
+        key_obs,
+        noise_std=data_config.noise_std,
+    )
+    x_reg = jax.random.uniform(
+        key_reg_x, (training.n_col,), minval=domain["x"][0], maxval=domain["x"][1]
+    )
+    t_reg = jax.random.uniform(
+        key_reg_t, (training.n_col,), minval=0.05, maxval=domain["t"][1]
+    )
+
+    pinn_image = image_name_for_backend(backend)
+    owns_pinn = pinn is None
+    owns_solver = solver is None
+    if owns_pinn:
+        pinn = Tesseract.from_image(pinn_image)
+    if owns_solver:
+        solver = Tesseract.from_image("burgers_solver")
+
+    params_flat = get_initial_params(backend, seed=data_config.seed)
+    log_viscosity = jnp.log(jnp.asarray(problem.initial_viscosity))
+    log_nu_bounds = None
+    if training.clip_log_viscosity:
+        log_nu_bounds = (
+            jnp.log(jnp.asarray(training.nu_clip_min, dtype=jnp.float32)),
+            jnp.log(jnp.asarray(training.nu_clip_max, dtype=jnp.float32)),
+        )
+    warmup_epochs = min(training.viscosity_warmup_epochs, max(0, training.n_epochs - 1))
+
+    log_visc_optimizer = optax.adam(training.log_nu_learning_rate)
+    log_visc_opt_state = log_visc_optimizer.init(log_viscosity)
+    param_optimizer = optax.adam(training.param_learning_rate)
+    param_opt_state = param_optimizer.init(params_flat)
+
+    loss_and_grads = jax.value_and_grad(
+        hybrid_discrepancy_loss, argnums=(0, 1), has_aux=True
+    )
+
+    viscosity = jnp.exp(log_viscosity)
+    times = []
+    viscosity_history = [float(viscosity)]
+    log_viscosity_history = [float(log_viscosity)]
+    loss_history = {name: [] for name in ("total", "data", "reg", "smooth")}
+    effective_weights = {"data": w_data, "reg": w_reg, "smooth": w_smooth}
+
+    def _run():
+        nonlocal log_viscosity, params_flat, viscosity
+        nonlocal log_visc_opt_state, param_opt_state
+
+        callback.on_start(
+            {
+                "config": config,
+                "backend": backend,
+                "image_name": pinn_image,
+                "solver_image": "burgers_solver",
+                "warmup_epochs": warmup_epochs,
+                "observations": obs,
+            }
+        )
+
+        for epoch in range(training.n_epochs):
+            start_time = time.time()
+
+            counter.reset()
+            with count_tesseract_calls(counter):
+                (loss, components), (log_v_grad, p_grad) = loss_and_grads(
+                    log_viscosity,
+                    params_flat,
+                    obs,
+                    x_reg,
+                    t_reg,
+                    solver,
+                    pinn,
+                    w_data,
+                    w_reg,
+                    w_smooth,
+                )
+            apply_calls = counter.apply_calls
+            vjp_calls = counter.vjp_calls
+
+            visc_grad_norm = float(jnp.abs(log_v_grad))
+            param_grad_norm = float(jnp.linalg.norm(p_grad))
+
+            viscosity_updated = epoch >= warmup_epochs
+            if viscosity_updated:
+                log_visc_updates, log_visc_opt_state = log_visc_optimizer.update(
+                    log_v_grad, log_visc_opt_state
+                )
+                log_viscosity = optax.apply_updates(log_viscosity, log_visc_updates)
+                if log_nu_bounds is not None:
+                    log_viscosity = jnp.clip(
+                        log_viscosity, log_nu_bounds[0], log_nu_bounds[1]
+                    )
+
+            param_updates, param_opt_state = param_optimizer.update(
+                p_grad, param_opt_state
+            )
+            params_flat = optax.apply_updates(params_flat, param_updates)
+            viscosity = jnp.exp(log_viscosity)
+
+            epoch_time = time.time() - start_time
+            times.append(epoch_time)
+            viscosity_history.append(float(viscosity))
+            log_viscosity_history.append(float(log_viscosity))
+
+            loss_components = {name: float(value) for name, value in components.items()}
+            if epoch % metrics_every == 0 or epoch == training.n_epochs - 1:
+                for name in loss_history:
+                    loss_history[name].append(loss_components[name])
+
+            callback.on_epoch(
+                EpochRecord(
+                    epoch=epoch,
+                    n_epochs=training.n_epochs,
+                    viscosity=float(viscosity),
+                    log_viscosity=float(log_viscosity),
+                    loss=float(loss),
+                    visc_grad_norm=visc_grad_norm,
+                    param_grad_norm=param_grad_norm,
+                    epoch_time=epoch_time,
+                    apply_calls=apply_calls,
+                    vjp_calls=vjp_calls,
+                    effective_weights=effective_weights,
+                    viscosity_updated=viscosity_updated,
+                    param_count=int(params_flat.size),
+                    brdr_weights=None,
+                    loss_components=loss_components,
+                )
+            )
+
+    if owns_pinn and owns_solver:
+        with pinn, solver:
+            _run()
+    elif owns_pinn:
+        with pinn:
+            _run()
+    elif owns_solver:
+        with solver:
+            _run()
+    else:
+        _run()
+
+    final_viscosity = float(viscosity)
+    relative_error = (
+        abs(final_viscosity - problem.true_viscosity) / problem.true_viscosity * 100
+    )
+    avg_time = sum(times) / len(times) * 1000 if times else 0.0
+
+    result = {
+        "mode": "hybrid",
+        "backend": backend,
+        "tesseract_image": pinn_image,
+        "solver_image": "burgers_solver",
+        "final_viscosity": final_viscosity,
+        "true_viscosity": problem.true_viscosity,
+        "dispersion_beta": problem.dispersion_beta,
+        "relative_error": relative_error,
+        "avg_time_ms": avg_time,
+        "viscosity_history": viscosity_history,
+        "log_viscosity_history": log_viscosity_history,
+        "loss_history": loss_history,
+        "effective_weights": effective_weights,
+        "seed": data_config.seed,
+        "config": config,
+        "params_flat": params_flat,
+        "observations": obs,
+        "pinn": pinn,
+        "solver": solver,
+    }
+    callback.on_finish(result)
+    return result
+
+
+#
+# Stage A baseline: solver-adjoint inversion (jax.grad through the solver VJP)
+#
+
+
+def solver_inverse_loss(log_viscosity, obs, solver):
+    """Data-fit loss for solver-adjoint inversion: ``||solver(nu)[obs] - u_obs||^2``.
+
+    Differentiating w.r.t. ``log_viscosity`` routes entirely through the solver
+    Tesseract's VJP endpoint. No neural network is involved -- this is the
+    PDE-constrained / adjoint inverse method, a baseline for the PINN method.
+    """
+    nu = jnp.exp(log_viscosity)
+    u_field = _solver_field(solver, nu, obs.x_grid, obs.t_grid)
+    u_pred = u_field[obs.t_idx, obs.x_idx]
+    return jnp.mean((u_pred - obs.u_obs) ** 2)
+
+
+def train_solver_inverse(config, *, solver=None, callback=None, metrics_every=20):
+    """Run solver-adjoint inversion: optimize ``log_nu`` against the in-loop solver.
+
+    One reverse-mode pass per step differentiates the data-fit loss through the
+    solver Tesseract VJP. Observations come from the same viscous-Burgers physics
+    (clean, well-posed inverse), so the estimate recovers ``nu`` up to noise.
+    """
+    problem = config.problem
+    data_config = config.data
+    training = config.training
+
+    callback = callback or TrainingCallback()
+    counter = TesseractCallCounter()
+
+    key = jax.random.PRNGKey(data_config.seed)
+    obs = generate_grid_observations(
+        data_config.n_obs,
+        problem.true_viscosity,
+        problem.domain,
+        key,
+        noise_std=data_config.noise_std,
+    )
+
+    owns_solver = solver is None
+    if owns_solver:
+        solver = Tesseract.from_image("burgers_solver")
+
+    log_viscosity = jnp.log(jnp.asarray(problem.initial_viscosity))
+    log_nu_bounds = None
+    if training.clip_log_viscosity:
+        log_nu_bounds = (
+            jnp.log(jnp.asarray(training.nu_clip_min, dtype=jnp.float32)),
+            jnp.log(jnp.asarray(training.nu_clip_max, dtype=jnp.float32)),
+        )
+
+    optimizer = optax.adam(training.log_nu_learning_rate)
+    opt_state = optimizer.init(log_viscosity)
+    loss_and_grad = jax.value_and_grad(solver_inverse_loss, argnums=0)
+
+    viscosity = jnp.exp(log_viscosity)
+    times = []
+    viscosity_history = [float(viscosity)]
+    log_viscosity_history = [float(log_viscosity)]
+    loss_history = {"total": [], "data": []}
+
+    def _run():
+        nonlocal log_viscosity, viscosity, opt_state
+
+        callback.on_start(
+            {
+                "config": config,
+                "backend": "solver",
+                "image_name": "burgers_solver",
+                "warmup_epochs": 0,
+                "observations": obs,
+            }
+        )
+
+        for epoch in range(training.n_epochs):
+            start_time = time.time()
+
+            counter.reset()
+            with count_tesseract_calls(counter):
+                loss, log_v_grad = loss_and_grad(log_viscosity, obs, solver)
+            apply_calls = counter.apply_calls
+            vjp_calls = counter.vjp_calls
+
+            updates, opt_state = optimizer.update(log_v_grad, opt_state)
+            log_viscosity = optax.apply_updates(log_viscosity, updates)
+            if log_nu_bounds is not None:
+                log_viscosity = jnp.clip(
+                    log_viscosity, log_nu_bounds[0], log_nu_bounds[1]
+                )
+            viscosity = jnp.exp(log_viscosity)
+
+            epoch_time = time.time() - start_time
+            times.append(epoch_time)
+            viscosity_history.append(float(viscosity))
+            log_viscosity_history.append(float(log_viscosity))
+
+            loss_value = float(loss)
+            loss_components = {"total": loss_value, "data": loss_value}
+            if epoch % metrics_every == 0 or epoch == training.n_epochs - 1:
+                loss_history["total"].append(loss_value)
+                loss_history["data"].append(loss_value)
+
+            callback.on_epoch(
+                EpochRecord(
+                    epoch=epoch,
+                    n_epochs=training.n_epochs,
+                    viscosity=float(viscosity),
+                    log_viscosity=float(log_viscosity),
+                    loss=loss_value,
+                    visc_grad_norm=float(jnp.abs(log_v_grad)),
+                    param_grad_norm=0.0,
+                    epoch_time=epoch_time,
+                    apply_calls=apply_calls,
+                    vjp_calls=vjp_calls,
+                    effective_weights={},
+                    viscosity_updated=True,
+                    param_count=0,
+                    brdr_weights=None,
+                    loss_components=loss_components,
+                )
+            )
+
+    if owns_solver:
+        with solver:
+            _run()
+    else:
+        _run()
+
+    final_viscosity = float(viscosity)
+    relative_error = (
+        abs(final_viscosity - problem.true_viscosity) / problem.true_viscosity * 100
+    )
+    avg_time = sum(times) / len(times) * 1000 if times else 0.0
+
+    result = {
+        "mode": "solver-inverse",
+        "backend": "solver",
+        "tesseract_image": "burgers_solver",
+        "final_viscosity": final_viscosity,
+        "true_viscosity": problem.true_viscosity,
+        "relative_error": relative_error,
+        "avg_time_ms": avg_time,
+        "viscosity_history": viscosity_history,
+        "log_viscosity_history": log_viscosity_history,
+        "loss_history": loss_history,
+        "seed": data_config.seed,
+        "config": config,
+        "observations": obs,
+        "solver": solver,
+    }
+    callback.on_finish(result)
+    return result
+
+
+def log_solver_inverse_results(result):
+    """Log the solver-adjoint inversion result table."""
+    table = Table(title="Solver-Adjoint Inversion")
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right", style="cyan")
+    table.add_row("Inferred ν", f"{result['final_viscosity']:.6f}")
+    table.add_row("True ν", f"{result['true_viscosity']:.6f}")
+    table.add_row("Relative error", f"{result['relative_error']:.2f}%")
+    table.add_row("Avg time/epoch", f"{result['avg_time_ms']:.1f} ms")
+    if result["loss_history"]["data"]:
+        table.add_row("Final data loss", f"{result['loss_history']['data'][-1]:.6e}")
+    CONSOLE.print(table)
+
+
+class SolverInverseCallback(TrainingCallback):
+    """CLI presentation for solver-adjoint inversion: progress bar + results, and
+    records per-epoch metrics rows for reproducible artifacts."""
+
+    def __init__(self, config):
+        self.config = config
+        self.true_viscosity = config.problem.true_viscosity
+        self.progress = make_training_progress()
+        self.task_id = None
+        self._last_loss = None
+        self.rows = []
+
+    def on_start(self, context):
+        initial = float(self.config.problem.initial_viscosity)
+        CONSOLE.log("Solver-adjoint inversion (jax.grad through solver Tesseract VJP)")
+        self.progress.start()
+        self.task_id = self.progress.add_task(
+            "solver-inverse",
+            total=self.config.training.n_epochs,
+            loss="pending",
+            nu=f"{initial:.6f}",
+            error=f"{abs(initial - self.true_viscosity):.6f}",
+            epoch_time="pending",
+        )
+
+    def on_epoch(self, record):
+        if record.loss_components is not None:
+            self._last_loss = record.loss_components["total"]
+        loss_text = (
+            f"{self._last_loss:.3e}" if self._last_loss is not None else "pending"
+        )
+        self.progress.update(
+            self.task_id,
+            advance=1,
+            loss=loss_text,
+            nu=f"{record.viscosity:.6f}",
+            error=f"{abs(record.viscosity - self.true_viscosity):.6f}",
+            epoch_time=f"{record.epoch_time * 1000:.0f}ms",
+        )
+        self.rows.append(
+            {
+                "epoch": record.epoch,
+                "viscosity": record.viscosity,
+                "log_viscosity": record.log_viscosity,
+                "loss": record.loss,
+                "visc_grad_norm": record.visc_grad_norm,
+                "param_grad_norm": record.param_grad_norm,
+                "epoch_time": record.epoch_time,
+                "apply_calls": record.apply_calls,
+                "vjp_calls": record.vjp_calls,
+                "viscosity_updated": record.viscosity_updated,
+            }
+        )
+
+    def on_finish(self, result):
+        self.progress.stop()
+        log_solver_inverse_results(result)
+
+
+def run_solver_inverse(config):
+    """Run solver-adjoint inversion with CLI presentation and image guard."""
+    if config.problem.initial_viscosity <= 0:
+        raise ValueError("initial_viscosity must be positive when optimizing log_nu")
+    ensure_image_available("burgers_solver")
+    CONSOLE.rule("[bold cyan]Solver-Adjoint Inversion")
+    callback = SolverInverseCallback(config)
+    result = train_solver_inverse(config, callback=callback)
+    result["metrics_rows"] = callback.rows
+    return result
+
+
 class RichProgressCallback(TrainingCallback):
     """CLI presentation: a live rich progress bar plus a final results table."""
 
@@ -1179,6 +1865,7 @@ def write_run_artifacts(result, rows, out_dir):
 
     last_row = rows[-1] if rows else {}
     summary = {
+        "mode": result.get("mode", "pinn"),
         "backend": result["backend"],
         "tesseract_image": result["tesseract_image"],
         "seed": result["seed"],
@@ -1189,7 +1876,7 @@ def write_run_artifacts(result, rows, out_dir):
         "epochs": len(result["viscosity_history"]) - 1,
         "apply_calls_per_step": last_row.get("apply_calls"),
         "vjp_calls_per_step": last_row.get("vjp_calls"),
-        "adaptive_loss_weights": result["adaptive_loss_weights"],
+        "adaptive_loss_weights": result.get("adaptive_loss_weights", False),
     }
     with (out_path / "summary.json").open("w", encoding="utf-8") as file:
         json.dump(_to_jsonable(summary), file, indent=2, sort_keys=True)
@@ -1331,6 +2018,58 @@ def run_single_backend(
     )
 
 
+def _last_call_counts(result):
+    """Return (apply, vjp) Tesseract dispatches per step from the last metrics row."""
+    rows = result.get("metrics_rows", [])
+    last = rows[-1] if rows else {}
+    return last.get("apply_calls"), last.get("vjp_calls")
+
+
+def log_method_comparison(results):
+    """Log a unified table comparing the inverse methods."""
+    table = Table(title="Inverse Method Comparison")
+    table.add_column("Method", style="bold")
+    table.add_column("Tesseract", style="dim")
+    table.add_column("Inferred ν", justify="right", style="cyan")
+    table.add_column("Rel error (%)", justify="right")
+    table.add_column("ms/epoch", justify="right")
+    table.add_column("apply/vjp per step", justify="right")
+
+    for label, result in results.items():
+        apply_calls, vjp_calls = _last_call_counts(result)
+        calls = (
+            f"{apply_calls}/{vjp_calls}"
+            if apply_calls is not None and vjp_calls is not None
+            else "-"
+        )
+        table.add_row(
+            label,
+            result["tesseract_image"],
+            f"{result['final_viscosity']:.6f}",
+            f"{result['relative_error']:.2f}",
+            f"{result['avg_time_ms']:.1f}",
+            calls,
+        )
+    CONSOLE.print(table)
+
+
+def compare_methods(config):
+    """Compare solver-adjoint inversion against the PINN method (JAX and PyTorch).
+
+    All three run on the same viscous-Burgers truth and data budget, exercising the
+    same uniform Tesseract interface across three swappable, framework-agnostic
+    components (the JAX solver and the JAX/PyTorch PINN). Observations are drawn
+    independently per method from the same physics and seed.
+    """
+    CONSOLE.rule("[bold cyan]Inverse Method Comparison")
+    results = {}
+    results["solver-adjoint"] = run_solver_inverse(config)
+    results["pinn (JAX)"] = run_single_backend(backend="jax", config=config)
+    results["pinn (PyTorch)"] = run_single_backend(backend="pytorch", config=config)
+    log_method_comparison(results)
+    return results
+
+
 def run_seed_sweep(
     backend="jax",
     seeds=(123,),
@@ -1405,10 +2144,20 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Inverse Problem Demo")
     parser.add_argument(
+        "--mode",
+        choices=["pinn", "solver-inverse", "compare"],
+        default="pinn",
+        help=(
+            "Inverse method: 'pinn' (jax.grad through the PINN Tesseract), "
+            "'solver-inverse' (solver-adjoint; jax.grad through the solver Tesseract), "
+            "or 'compare' (solver-adjoint vs PINN JAX/PyTorch in one table)"
+        ),
+    )
+    parser.add_argument(
         "--backend",
         choices=["jax", "pytorch", "both"],
         default="both",
-        help="Which backend to use",
+        help="Which PINN backend to use (pinn mode only)",
     )
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument(
@@ -1501,7 +2250,11 @@ if __name__ == "__main__":
     )
 
     try:
-        if args.seeds:
+        if args.mode == "solver-inverse":
+            results = run_solver_inverse(config=config)
+        elif args.mode == "compare":
+            results = compare_methods(config=config)
+        elif args.seeds:
             results = run_seed_sweep(
                 backend=args.backend,
                 seeds=args.seeds,
