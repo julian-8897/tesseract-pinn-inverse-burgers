@@ -1,7 +1,7 @@
-.PHONY: compile lint format test build-tesseracts smoke benchmark run-cli run-app
+.PHONY: compile lint format test build-tesseracts train-posterior smoke benchmark run-cli run-app
 
 compile:
-	uv run python -m py_compile app.py inverse_problem.py configs.py
+	uv run python -m py_compile app.py inverse_problem.py configs.py fmpe_posterior.py
 
 lint:
 	uv run --with ruff ruff check .
@@ -16,6 +16,9 @@ test:
 
 build-tesseracts:
 	./buildall.sh
+
+train-posterior:
+	uv run python fmpe_posterior.py train --n-sims 10000
 
 smoke:
 	uv run --with pytest python -m pytest tests/test_container_smoke.py -q

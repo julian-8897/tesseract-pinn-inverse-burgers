@@ -1,0 +1,8 @@
+name: fmpe_posterior
+version: 0.1.0
+description: "Amortized flow-matching (FMPE) posterior over Burgers parameters (nu, ic_amp, ic_phase) from a sparse observation vector"
+
+build_config:
+  # Bake the trained posterior into the image next to tesseract_api.py.
+  package_data:
+    - [posterior.pkl, /tesseract/posterior.pkl]

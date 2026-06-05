@@ -1,4 +1,4 @@
-1# Backend-Agnostic Inverse Burgers with Tesseract
+# Backend-Agnostic Inverse Burgers with Tesseract
 
 [![tesseract-core v1.2.0](https://img.shields.io/badge/tesseract--core-v1.2.0-blue)](https://github.com/pasteurlabs/tesseract-core)
 [![tesseract-jax v0.2.3](https://img.shields.io/badge/tesseract--jax-v0.2.3-green)](https://github.com/pasteurlabs/tesseract-jax)
@@ -11,7 +11,7 @@
 This project estimates the viscosity coefficient of the 1D viscous Burgers
 equation from sparse noisy observations, and showcases **Tesseract as a registry
 of framework-agnostic, swappable, differentiable model components**. The physics
-solver, the PINN surrogate, and (next) the posterior sampler are each packaged as
+solver, the PINN surrogate, and the posterior sampler are each packaged as
 an independent Tesseract behind one uniform typed schema — so you swap a JAX
 component for a PyTorch one by changing an image name, with identical calling
 code and no shared environment.
@@ -28,11 +28,11 @@ The inverse problem is solved two ways, both differentiating through a Tesseract
 same physics and prints a unified table.
 
 **Key implementations:**
-- Three swappable, framework-agnostic Tesseracts: a JAX pseudospectral **solver**, and a **PINN** with interchangeable JAX/PyTorch backends behind one `apply`/`vector_jacobian_product` contract
+- Three swappable, framework-agnostic Tesseracts: a JAX pseudospectral **solver**, a **PINN** with interchangeable JAX/PyTorch backends behind one `apply`/`vector_jacobian_product` contract, and an apply-only **FMPE posterior** sampler
 - Two differentiable inverse methods (solver-adjoint and PINN) compared on identical physics
 - Shared callback-driven training engines; measured Tesseract apply/VJP telemetry per gradient step
 - Configurable loss weights, optional BRDR adaptive residual weighting, `log_nu` optimization, seeded runs, seed sweeps, reproducible artifacts
-- Roadmap: amortized flow-matching posterior over `nu` for calibrated uncertainty (see `INVERSE_FMPE_PLAN.md`)
+- Amortized flow-matching posterior over `nu` for calibrated uncertainty, packaged as the third swappable Tesseract
 
 ---
 
@@ -222,11 +222,16 @@ cd tesseract-pinn-inverse-burgers
 # Install Python dependencies from pyproject.toml / uv.lock
 uv sync
 
-# Build Tesseract containers (requires Docker running)
+# Build Tesseract containers (requires Docker running).
+# fmpe_posterior is skipped until its gitignored posterior.pkl is trained.
 ./buildall.sh
 
+# Optional: train the posterior model, then build the fmpe_posterior Tesseract
+make train-posterior
+uv run tesseract build tesseracts/fmpe_posterior
+
 # Verify built images
-docker images | grep -E 'burgers_solver|pinn'
+docker images | grep -E 'burgers_solver|pinn|fmpe_posterior'
 ```
 
 `pyproject.toml` and `uv.lock` are the dependency source of truth. No separate
@@ -292,6 +297,32 @@ The Streamlit app provides:
 - Backend consistency report for JAX vs PyTorch runs
 
 The CLI is the reference path for dataclass configs and seeded runs. The Streamlit app follows the same solver-backed observation generation, `log_nu` optimization, and optional adaptive loss-weighting path for interactive runs.
+
+### Uncertainty quantification (amortized flow-matching posterior)
+
+Beyond the point estimates above, an amortized **Flow Matching Posterior
+Estimation** (FMPE, via `sbi` + `zuko`) gives a posterior over the Burgers
+parameters `(nu, ic_amp, ic_phase)` from a sparse observation vector. The trained
+flow is packaged as the **third swappable Tesseract** (`fmpe_posterior`), alongside
+the JAX solver and the JAX/PyTorch PINN.
+
+```bash
+# Train the posterior (simulation-based) and persist it for packaging
+uv run python fmpe_posterior.py train --n-sims 10000 --calibrate
+
+# Build the posterior Tesseract (needs the trained posterior.pkl from `train`)
+uv run tesseract build tesseracts/fmpe_posterior
+
+# Query the posterior for an observation, via the container
+uv run python fmpe_posterior.py demo --tesseract --nu 0.05
+```
+
+The posterior recovers `nu` with honest uncertainty (90% credible interval
+containing the truth) and is validated with **simulation-based calibration (SBC)**
+and **TARP coverage**. In the reference run the joint TARP coverage is calibrated
+and the IC-parameter marginals pass SBC; the `nu` marginal is mildly overconfident
+(SBC c2st ≈ 0.63) — reported honestly, a known characteristic of neural posterior
+estimators on the hardest marginal.
 
 ### Tests
 
@@ -359,7 +390,7 @@ uv run python scripts/regenerate_figures.py --epochs 100 --seed 123 --nx 160 --n
 
 ## Limitations and Roadmap
 
-- **Frontier UQ (next):** an amortized **flow-matching posterior** over `nu` (a third swappable Tesseract) for calibrated uncertainty, validated with simulation-based calibration / coverage. See `INVERSE_FMPE_PLAN.md`.
+- **Frontier UQ:** an amortized **flow-matching posterior** over `nu` (a third swappable Tesseract) provides calibrated uncertainty and is validated with simulation-based calibration / coverage. The trained `posterior.pkl` is reproducible via `python fmpe_posterior.py train` and is intentionally not committed.
 - **Single scalar parameter inversion:** the inverse target is viscosity `nu` only; joint inference of initial-condition parameters is a natural extension.
 - **Model-misspecification sidebar (experimental):** a KdV-Burgers truth oracle (`solve_kdv_burgers`) plus a learned-discrepancy hybrid (`train_hybrid_inverse`) are included to *demonstrate* a known failure mode — naive calibration-with-discrepancy is confounded with the calibration parameter and biases it (Brynjarsdóttir & O'Hagan, 2014). This is documented as a limitation, not a headline result, and motivates the posterior treatment above.
 - **No checkpointing; PINN model reconstructed from `params_flat` per call.**

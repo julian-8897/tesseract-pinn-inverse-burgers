@@ -27,6 +27,13 @@ fi
 
 for tess_dir in tesseracts/*/
 do
+    if [ "${tess_dir}" = "tesseracts/fmpe_posterior/" ] && [ ! -f "${tess_dir}posterior.pkl" ]; then
+        echo "Skipping ${tess_dir}: posterior.pkl is missing."
+        echo "Train it first with: uv run python fmpe_posterior.py train --n-sims 10000"
+        echo ""
+        continue
+    fi
+
     echo "Building ${tess_dir}"
     tesseract build ${tess_dir}
     echo "✓ ${tess_dir} built successfully"
