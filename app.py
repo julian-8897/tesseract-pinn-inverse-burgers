@@ -42,8 +42,8 @@ from inverse_problem import (
 )
 
 st.set_page_config(
-    page_title="Tesseract Swappable Components — Inverse Burgers",
-    page_icon="",
+    page_title="Inverse Burgers with Tesseract",
+    page_icon="🌊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -53,9 +53,12 @@ st.markdown(
 <style>
 .stMetric {
     background-color: #f0f2f6;
-    padding: 10px;
-    border-radius: 5px;
+    padding: 12px 14px;
+    border-radius: 8px;
 }
+div[data-testid="stMetricValue"] { font-size: 1.05rem; }
+h1 { letter-spacing: -0.5px; }
+section[data-testid="stSidebar"] { min-width: 330px; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -501,18 +504,22 @@ class StreamlitTrainingCallback(TrainingCallback):
 
 def render_pinn_demo():
     """PINN inversion with swappable JAX / PyTorch Tesseract containers."""
-    st.header("PINN inversion — swappable JAX / PyTorch containers")
+    st.header("PINN inversion across JAX and PyTorch")
     st.caption(
-        "Method 2 of 3 · `jax.grad` flows through the PINN Tesseract VJP; the PINN "
-        "backend swaps between JAX and PyTorch with identical calling code."
+        "A neural network learns the flow while the optimizer recovers the "
+        "viscosity, through whichever backend you pick."
     )
 
-    st.markdown("""
-    This demo keeps the optimizer, loss function, and inverse-problem orchestration in JAX.
-    The only component that changes is the Tesseract PINN container. Tesseract exposes
-    backend-specific apply/VJP endpoints as JAX primitives, so `jax.grad` can optimize
-    through either backend.
-    """)
+    st.markdown(
+        """
+Here a neural network learns the flow field at the same time the optimizer infers
+the viscosity. The outer loop never leaves JAX: one objective, one set of Optax
+updates, one piece of orchestration. The only moving part is the PINN container.
+Choose the JAX build or the PyTorch build, and `jax.grad` drives the gradient through
+whichever you picked, because Tesseract presents both as ordinary JAX primitives. Run
+the two in turn and the app checks they land on the same viscosity.
+        """
+    )
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Host Loop", "JAX + Optax")
@@ -544,10 +551,9 @@ updates for log_nu and params_flat""",
             r"\frac{\partial u}{\partial t} + u \frac{\partial u}{\partial x} = \nu \frac{\partial^2 u}{\partial x^2}"
         )
         st.caption(
-            "In this PINN method the solver Tesseract generates the noisy observations offline; "
-            "the active autodiff boundary is the PINN container. The other two methods "
-            "(solver-adjoint inversion and the FMPE posterior) make the solver and posterior "
-            "Tesseracts the active boundary — switch methods in the sidebar."
+            "The solver makes the noisy observations ahead of time. During training "
+            "the PINN container is the piece gradients flow through. Switch methods in "
+            "the sidebar to put the solver or the posterior at the center instead."
         )
 
     st.sidebar.header("Configuration")
@@ -1260,14 +1266,13 @@ updates for log_nu and params_flat""",
         # Initial state - show info
         st.info(
             """
-        **Configure parameters in the sidebar and click "Run Tesseract Inversion" to begin.**
+        **Set the parameters in the sidebar and press "Run Tesseract Inversion" to start.**
 
-        **Tesseract showcase workflow:**
-        1. Keep the inverse objective and Optax optimizers in JAX
-        2. Route PINN apply/VJP calls through the selected Tesseract container
-        3. Infer the viscosity parameter and monitor gradient flow across the boundary
-        4. Visualize the learned field against the solver-generated ground truth
-        5. Switch containers and retrain with the same settings to check backend consistency
+        A run keeps the objective and the Optax optimizers in JAX and sends the PINN's
+        forward and gradient calls to the container you picked. It infers the viscosity,
+        plots the learned field against the solver's ground truth, and tracks the
+        gradients crossing the boundary. Run the JAX build and the PyTorch build with
+        the same settings and the app compares what the two recovered.
         """
         )
 
@@ -1393,57 +1398,84 @@ def get_fmpe_component():
 
 
 def render_app_header():
-    """Shared three-Tesseract framing shown above every method."""
-    st.title("Tesseract Swappable Components — Inverse Burgers")
-    st.subheader(
-        "One inverse problem, three independent Tesseracts behind one uniform schema"
-    )
+    """Shared framing and component overview shown above every method."""
+    st.title("Inverse Burgers with Tesseract")
+    st.subheader("Recover a fluid's hidden viscosity, three different ways")
     st.markdown(
         """
-This project treats **Tesseract as a registry of framework-agnostic, swappable,
-differentiable model components**. The physics **solver**, the **PINN** surrogate,
-and the **posterior** sampler are each packaged as an independent Tesseract with the
-same typed `apply` contract — so you swap a JAX component for a PyTorch one (or a
-deterministic estimate for a full posterior) by changing an image name, with
-identical calling code and no shared environment.
+A fluid moving under the Burgers equation builds sharp fronts that then smear out.
+How fast they smear is set by one number in the equation, the viscosity, and here
+that number is unknown. All you get to see is noisy measurements of the flow. Each
+method below reads those measurements and works the viscosity back out. The third
+goes one step further and says how sure it is.
+
+The point of the demo is what sits underneath. Tesseract wraps each method as a
+standalone component, and the three share one typed interface. A spectral solver, a
+physics-informed neural network, and a trained posterior sampler each run in their
+own container. Trading a JAX model for a PyTorch one, or a single best guess for a
+full probability distribution, comes down to changing a name. The code that calls
+them does not move.
         """
     )
-    col1, col2, col3 = st.columns(3)
-    col1.metric(
-        "① Solver Tesseract",
-        "burgers_solver",
-        help="JAX pseudospectral solver; differentiable (VJP/JVP)",
-    )
-    col2.metric(
-        "② PINN Tesseract",
-        "pinn_jax / pinn_pytorch",
-        help="Swappable JAX or PyTorch backend; differentiable (VJP)",
-    )
-    col3.metric(
-        "③ Posterior Tesseract",
-        "fmpe_posterior",
-        help="Amortized flow-matching posterior; apply-only (no VJP)",
-    )
+
+    with st.expander("The physics, in one line"):
+        st.latex(
+            r"\frac{\partial u}{\partial t} + u\,\frac{\partial u}{\partial x}"
+            r" = \nu\,\frac{\partial^2 u}{\partial x^2}"
+        )
+        st.caption(
+            "u(x, t) is the velocity field on a periodic domain. ν is the viscosity "
+            "we want back. Larger ν means fronts that round off sooner."
+        )
+
+    st.markdown("##### The three components")
+    card1, card2, card3 = st.columns(3)
+    with card1.container(border=True):
+        st.markdown("**🌊 Solver** &nbsp; `burgers_solver`", unsafe_allow_html=True)
+        st.write(
+            "A fast spectral simulator of the flow. Gradients run straight through "
+            "it, so you can optimize against it."
+        )
+        st.caption("Differentiable · JAX")
+    with card2.container(border=True):
+        st.markdown(
+            "**🧠 PINN** &nbsp; `pinn_jax` · `pinn_pytorch`", unsafe_allow_html=True
+        )
+        st.write(
+            "A neural network trained to obey the physics. It ships as a JAX build "
+            "and a PyTorch build that you can swap at will."
+        )
+        st.caption("Differentiable · JAX or PyTorch")
+    with card3.container(border=True):
+        st.markdown("**📊 Posterior** &nbsp; `fmpe_posterior`", unsafe_allow_html=True)
+        st.write(
+            "A pre-trained network that turns one measurement into a probability "
+            "distribution over the answer. It only runs forward."
+        )
+        st.caption("Forward only · PyTorch")
+
     st.caption(
-        "Pick a method in the sidebar. Each one makes a *different* Tesseract the "
-        "active boundary of the same inverse problem."
+        "Choose a method in the sidebar. Each one puts a different component at the "
+        "center of the same problem."
     )
 
 
 def render_solver_demo():
     """Solver-adjoint inversion: differentiate through the solver Tesseract VJP."""
-    st.header("Solver-adjoint inversion — differentiate through the solver Tesseract")
+    st.header("Solver-adjoint inversion")
     st.caption(
-        "Method 1 of 3 · `jax.grad` flows entirely through the Burgers *solver* "
-        "Tesseract VJP. No neural network — the PDE-constrained baseline."
+        "Guess a viscosity, run the solver, and let the gradient through the solver "
+        "pull the guess toward the data."
     )
     st.markdown(
         """
-        The objective is a pure data fit, ``L(ν) = ‖solver(ν)[sensors] − u_obs‖²``.
-        Optimizing ``log ν`` with Optax differentiates this loss through the solver
-        Tesseract's reverse-mode endpoint, so the gradient is the PDE adjoint. Because
-        the observations come from the *same* viscous-Burgers physics, this inverse
-        problem is well-posed and recovers ``ν`` up to the observation noise.
+This is the most direct of the three. Guess a viscosity, run the solver, and compare
+its output against the measurements. That mismatch is the only thing being minimized.
+Optax nudges the viscosity to shrink it, and the gradient it needs comes from the
+solver's own reverse-mode endpoint, which is the classical PDE adjoint. No neural
+network sits in the loop. The measurements were made on the same Burgers physics the
+solver runs, so the problem is well-posed: the estimate settles on the true
+viscosity, give or take the observation noise.
         """
     )
     col1, col2, col3 = st.columns(3)
@@ -1528,8 +1560,8 @@ update for log_nu""",
         "Run Solver-Adjoint Inversion", type="primary", key="solver_run"
     ):
         st.info(
-            "Configure parameters in the sidebar and click **Run Solver-Adjoint "
-            "Inversion**. This method requires the `burgers_solver` Tesseract image."
+            "Set the parameters in the sidebar and press **Run Solver-Adjoint "
+            "Inversion**. This method needs the `burgers_solver` image built."
         )
         return
 
@@ -1655,27 +1687,24 @@ update for log_nu""",
 
 def render_fmpe_demo():
     """Amortized FMPE posterior: the apply-only posterior Tesseract (UQ)."""
-    st.header("Amortized posterior — FMPE (uncertainty quantification)")
-    st.caption(
-        "Method 3 of 3 · the apply-only *flow-matching posterior* Tesseract maps one "
-        "sparse observation to a full posterior over (ν, ic_amp, ic_phase)."
-    )
+    st.header("Posterior inference with flow matching")
+    st.caption("One measurement in, a full distribution over the answer out.")
     st.markdown(
         """
-        Instead of a point estimate, an amortized **Flow Matching Posterior Estimator**
-        (trained offline with `sbi` + `zuko`) returns the full posterior in a single
-        forward pass. It is packaged as the **third swappable Tesseract**
-        (`fmpe_posterior`) — apply-only, so it exposes *no* VJP/JVP endpoints, unlike
-        the differentiable solver and PINN components.
+The first two methods hand back a single number. This one hands back a distribution.
+A flow-matching network, trained ahead of time on thousands of simulated flows, reads
+one sparse measurement and returns a posterior over all three parameters at once: the
+viscosity, plus the two values that set the starting wave. It only runs forward, with
+no gradients, so its container offers a single `apply` call. Set a ground truth
+on the left and the panels show what the network believes once it has seen the data.
         """
     )
 
     bundle = load_fmpe_bundle(FMPE_BUNDLE_PATH)
     if bundle is None:
         st.warning(
-            "No trained posterior found at "
-            f"`{FMPE_BUNDLE_PATH}`. Train it first (the bundle is gitignored — it is "
-            "large and reproducible):"
+            f"No trained posterior at `{FMPE_BUNDLE_PATH}`. Train it first. The "
+            "bundle stays out of git because it is large and reproducible:"
         )
         st.code("make train-posterior", language="bash")
         return
@@ -1697,9 +1726,9 @@ def render_fmpe_demo():
 
     st.sidebar.header("Ground-truth parameters")
     st.sidebar.caption(
-        "Pick a true (ν, ic_amp, ic_phase) inside the training prior. The solver "
-        "generates a noisy observation at the trained sensor layout; the posterior "
-        "Tesseract then infers the parameters back."
+        "Choose a true (ν, ic_amp, ic_phase) within the training range. The solver "
+        "makes a noisy measurement at the fixed sensor layout, and the posterior "
+        "network infers the parameters back from it."
     )
     nice_labels = {
         "nu": "Viscosity ν",
@@ -1738,12 +1767,12 @@ def render_fmpe_demo():
 
     if not st.sidebar.button("Sample Posterior", type="primary", key="fmpe_run"):
         st.info(
-            "Choose ground-truth parameters in the sidebar and click **Sample "
-            "Posterior**. Runs fully in-process — no Docker image required."
+            "Pick ground-truth parameters in the sidebar and press **Sample "
+            "Posterior**. Everything runs in-process, so no Docker image is needed."
         )
         return
 
-    with st.spinner("Simulating observation and sampling the posterior Tesseract..."):
+    with st.spinner("Simulating the measurement and sampling the posterior..."):
         from fmpe_posterior import observation_from_theta
 
         observation = (
@@ -1830,11 +1859,11 @@ def render_fmpe_demo():
     st.dataframe(summary, hide_index=True)
 
     st.info(
-        "**Calibration caveat (reported honestly):** reference SBC/TARP diagnostics show "
-        "joint coverage is calibrated and the IC marginals pass, but the **ν marginal is "
-        "mildly overconfident** (SBC c2st ≈ 0.63). Treat the ν credible interval as a "
-        "lower bound on its true width. See the README's UQ section and "
-        "`scripts/fmpe_diagnostics.py`."
+        "**Read the viscosity interval with some caution.** In the calibration checks "
+        "(SBC and TARP) the joint coverage holds up and both initial-condition "
+        "parameters pass, but the viscosity marginal comes out a touch too tight (SBC "
+        "c2st near 0.63). Its real spread is wider than the band drawn here. Full "
+        "diagnostics live in the README's UQ section and `scripts/fmpe_diagnostics.py`."
     )
 
 
@@ -1844,16 +1873,17 @@ def main():
     st.markdown("---")
 
     method = st.sidebar.radio(
-        "Inverse method (which Tesseract is the boundary)",
-        ("Solver-adjoint", "PINN (JAX ↔ PyTorch)", "FMPE posterior (UQ)"),
+        "Method",
+        ("Solver-adjoint", "PINN (JAX or PyTorch)", "Posterior (FMPE)"),
         index=1,
-        help="Each method runs the same inverse problem through a different Tesseract.",
+        help="Each choice puts a different Tesseract component at the center of the "
+        "same inverse problem.",
     )
     st.sidebar.markdown("---")
 
     if method == "Solver-adjoint":
         render_solver_demo()
-    elif method.startswith("FMPE"):
+    elif method.startswith("Posterior"):
         render_fmpe_demo()
     else:
         render_pinn_demo()
