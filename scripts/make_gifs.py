@@ -57,7 +57,7 @@ def optimize_gif(path, *, colors=160):
 
 
 def make_burgers_evolution(
-    path, *, nu_low=0.01, nu_high=0.08, nt=110, frames=50, fps=18
+    path, *, nu_low=0.01, nu_high=0.08, nt=110, frames=50, fps=12
 ):
     """Animate the space-time field u(x, t) filling in for low and high viscosity."""
     solve = get_burgers_solver()
@@ -124,7 +124,7 @@ def make_burgers_evolution(
     print(f"wrote {path}")
 
 
-def make_posterior_tracking(path, *, n_frames=36, n_samples=1500, fps=14):
+def make_posterior_tracking(path, *, n_frames=36, n_samples=1500, fps=9):
     """Animate the nu posterior following a ground truth that sweeps the prior."""
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
