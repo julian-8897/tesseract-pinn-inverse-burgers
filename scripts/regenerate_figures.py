@@ -169,14 +169,13 @@ def save_field_figure(result, out_path, nx, nt):
 
 
 def save_comparison_figure(results, out_path):
-    """Save a compact four-panel backend comparison figure."""
-    fig, axes = plt.subplots(
+    """Save a two-panel backend comparison: viscosity trajectory and training loss."""
+    fig, (ax_visc, ax_loss) = plt.subplots(
+        1,
         2,
-        2,
-        figsize=paper_size("double", ratio=0.72),
+        figsize=paper_size("double", ratio=0.42),
         constrained_layout=True,
     )
-    ax_visc, ax_loss, ax_final, ax_calls = axes.ravel()
 
     true_nu = next(iter(results.values()))["true_viscosity"]
     for backend, result in results.items():
@@ -218,47 +217,7 @@ def save_comparison_figure(results, out_path):
     ax_loss.legend(loc="upper right")
     ax_loss.grid(False)
 
-    backends = list(results)
-    positions = np.arange(len(backends))
-    final_values = [results[name]["final_viscosity"] for name in backends]
-    final_colors = [BACKEND_STYLES[name]["color"] for name in backends]
-    ax_final.bar(positions, final_values, color=final_colors, width=0.62)
-    ax_final.axhline(true_nu, color="#dc2626", linestyle="--")
-    ax_final.set_xticks(
-        positions,
-        [BACKEND_STYLES[name]["label"] for name in backends],
-    )
-    ax_final.set_xlabel("PINN backend")
-    ax_final.set_ylabel(r"Final viscosity $\nu$")
-
-    width = 0.34
-    apply_calls = [
-        results[name]["metrics_rows"][-1]["apply_calls"] for name in backends
-    ]
-    vjp_calls = [results[name]["metrics_rows"][-1]["vjp_calls"] for name in backends]
-    ax_calls.bar(
-        positions - width / 2,
-        apply_calls,
-        width,
-        label="Apply",
-        color="#56B4E9",
-    )
-    ax_calls.bar(
-        positions + width / 2,
-        vjp_calls,
-        width,
-        label="VJP",
-        color="#009E73",
-    )
-    ax_calls.set_xticks(
-        positions,
-        [BACKEND_STYLES[name]["label"] for name in backends],
-    )
-    ax_calls.set_xlabel("PINN backend")
-    ax_calls.set_ylabel("Calls in final epoch")
-    ax_calls.legend(loc="upper right")
-
-    for label, ax in zip(("(a)", "(b)", "(c)", "(d)"), axes.ravel(), strict=True):
+    for label, ax in zip(("(a)", "(b)"), (ax_visc, ax_loss), strict=True):
         ax.text(
             0.01,
             1.02,
