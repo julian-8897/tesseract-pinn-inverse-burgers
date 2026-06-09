@@ -18,6 +18,7 @@ dependencies = [
     "pydantic>=2.12.5",
     "rich>=14.2.0",
     "sbi>=0.26.1",
+    "scienceplots>=2.1.1",
     "seaborn>=0.13.2",
     "streamlit>=1.32.0",
     "tesseract-core[runtime]>=1.2.0",
@@ -29,6 +30,7 @@ dependencies = [
 
 [tool.setuptools]
 py-modules = ["app", "configs", "inverse_problem", "fmpe_posterior"]
+packages = ["scripts"]
 
 [tool.pytest.ini_options]
 markers = [

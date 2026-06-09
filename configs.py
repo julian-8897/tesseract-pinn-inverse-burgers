@@ -10,6 +10,8 @@ from math import isfinite
 # by the deterministic observation samplers and the FMPE simulator so the two paths
 # never silently disagree.
 DEFAULT_NOISE_STD = 0.02
+DEFAULT_FMPE_PRIOR_LOW = (0.02, 0.8, -0.4)
+DEFAULT_FMPE_PRIOR_HIGH = (0.10, 1.2, 0.4)
 
 
 def _check_positive(name, value):
@@ -158,6 +160,48 @@ class RunConfig:
 
     def with_seed(self, seed: int):
         return replace(self, data=replace(self.data, seed=seed))
+
+
+@dataclass(frozen=True)
+class FMPEConfig:
+    """Reproducible configuration for FMPE simulation and training."""
+
+    n_sims: int = 4000
+    n_sensors: int = 64
+    noise_std: float = DEFAULT_NOISE_STD
+    sensor_seed: int = 0
+    simulation_seed: int = 0
+    training_seed: int = 1
+    device: str = "cpu"
+    max_num_epochs: int | None = None
+    show_train_summary: bool = False
+    prior_low: tuple[float, float, float] = DEFAULT_FMPE_PRIOR_LOW
+    prior_high: tuple[float, float, float] = DEFAULT_FMPE_PRIOR_HIGH
+
+    def __post_init__(self):
+        for name in ("n_sims", "n_sensors"):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if float(self.noise_std) < 0 or not isfinite(float(self.noise_std)):
+            raise ValueError("noise_std must be a finite non-negative value")
+        for name in ("sensor_seed", "simulation_seed", "training_seed"):
+            if int(getattr(self, name)) < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.max_num_epochs is not None and int(self.max_num_epochs) <= 0:
+            raise ValueError("max_num_epochs must be a positive integer or None")
+        if not self.device:
+            raise ValueError("device must be a non-empty string")
+        if len(self.prior_low) != 3 or len(self.prior_high) != 3:
+            raise ValueError("FMPE prior bounds must contain three parameters")
+        for index, (low, high) in enumerate(
+            zip(self.prior_low, self.prior_high, strict=True)
+        ):
+            if not (isfinite(float(low)) and isfinite(float(high))):
+                raise ValueError(f"FMPE prior bounds at index {index} must be finite")
+            if float(low) >= float(high):
+                raise ValueError(
+                    f"FMPE prior lower bound at index {index} must be less than upper"
+                )
 
 
 DEFAULT_LOSS_WEIGHTS = LossWeights().as_dict()

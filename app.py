@@ -5,16 +5,13 @@ enabling JAX-based optimization of PyTorch PINN models via VJP (Vector-Jacobian 
 """
 
 import json
-import subprocess
 from dataclasses import dataclass
 
-import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import streamlit as st
-from tesseract_jax import apply_tesseract
 
 from configs import (
     DEFAULT_LOSS_WEIGHTS,
@@ -28,7 +25,8 @@ from configs import (
 from inverse_problem import (
     Tesseract,
     TrainingCallback,
-    get_burgers_solver,
+    docker_image_available,
+    evaluate_pinn_solution_grid,
     image_name_for_backend,
     train_inverse,
 )
@@ -91,25 +89,6 @@ def history_frame(history, epoch_key="epoch"):
     return pd.DataFrame(
         {epoch_key: np.arange(len(next(iter(history.values())))), **history}
     )
-
-
-def docker_image_available(image_name):
-    """Return whether a local Tesseract Docker image exists."""
-    try:
-        result = subprocess.run(
-            ["docker", "inspect", image_name, "--type", "image"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return False
-    return result.returncode == 0
-
-
-def pinn_image_name(backend):
-    """Map the selected backend to its local Tesseract image."""
-    return image_name_for_backend(backend)
 
 
 def render_tesseract_contract(backend, image_name, trace_enabled):
@@ -194,33 +173,6 @@ def initialize_session_state():
         st.session_state.show_gradient_inspector = False
 
 
-def generate_solution_grid(true_viscosity, params_flat, pinn, nx=128, nt=64):
-    """Generate PINN and solver solutions on a grid for visualization."""
-    x = np.linspace(0, 1, nx, endpoint=False, dtype=np.float32)
-    t = np.linspace(0, 1, nt, dtype=np.float32)
-    X, T = np.meshgrid(x, t)
-
-    # Flatten for tesseract evaluation
-    x_flat = jnp.array(X.flatten(), dtype=jnp.float32)
-    t_flat = jnp.array(T.flatten(), dtype=jnp.float32)
-
-    result = apply_tesseract(
-        pinn, {"x": x_flat, "t": t_flat, "params_flat": params_flat}
-    )
-    u_pred = np.array(result["u_pred"]).reshape(nt, nx)
-
-    solve_burgers = get_burgers_solver()
-    u_solver = solve_burgers(
-        jnp.asarray(true_viscosity, dtype=jnp.float32),
-        jnp.asarray(x, dtype=jnp.float32),
-        jnp.asarray(t, dtype=jnp.float32),
-        jnp.array(1.0, dtype=jnp.float32),
-        jnp.array(0.0, dtype=jnp.float32),
-    )
-
-    return X, T, u_pred, np.array(u_solver)
-
-
 def render_gradient_flow_inspector(backend, gradient_metrics):
     """Render the gradient flow inspector UI."""
     st.markdown(f"""
@@ -290,15 +242,11 @@ def render_gradient_flow_inspector(backend, gradient_metrics):
         col3.metric("Total AD operations", latest.apply_calls + latest.vjp_calls)
 
         st.info(f"""
-        **PINN Loss Architecture**: Each epoch computes a composite loss with {latest.apply_calls} network evaluations:
+        **Complete epoch telemetry**: this traced epoch made {latest.apply_calls} `apply()` calls across the optimization pass, optional BRDR preparation, and periodic metric evaluation.
 
-        1. **Data loss**: MSE at observation points
-        2. **Physics loss**: PDE residual
-        3. **Initial condition**: enforce u(x, t=0)
-        4. **Boundary left**: periodic boundary value
-        5. **Boundary right**: periodic boundary value
+        One composite PINN loss evaluates data, physics, initial-condition, and both periodic-boundary point sets. Metric epochs evaluate those components once more; BRDR epochs also evaluate pointwise losses before the gradient pass.
 
-        Then **{latest.vjp_calls} VJP calls** compute gradients: dL/dlog_nu and dL/dparams_flat.
+        The epoch made **{latest.vjp_calls} VJP calls** while computing gradients with respect to `log_nu` and `params_flat`.
 
         {"VJP calls route through PyTorch autograd" if backend == "pytorch" else "The JAX container uses native JAX autodiff behind the same Tesseract interface."}
         """)
@@ -824,7 +772,7 @@ updates for log_nu and params_flat""",
             st.session_state.training = False
             return
 
-        image_name = pinn_image_name(backend)
+        image_name = image_name_for_backend(backend)
         if not docker_image_available(image_name):
             st.error(f"Tesseract image `{image_name}` was not found.")
             st.code("./buildall.sh", language="bash")
@@ -1088,7 +1036,7 @@ updates for log_nu and params_flat""",
 
             with tabs[2]:
                 with st.spinner("Generating solution visualization..."):
-                    X, T, u_pred, u_ground_truth = generate_solution_grid(
+                    X, T, u_pred, u_ground_truth = evaluate_pinn_solution_grid(
                         true_viscosity, params_flat, pinn
                     )
 
@@ -1220,8 +1168,8 @@ updates for log_nu and params_flat""",
                             },
                             {
                                 "check": "different Tesseract image",
-                                "jax": pinn_image_name("jax"),
-                                "pytorch": pinn_image_name("pytorch"),
+                                "jax": image_name_for_backend("jax"),
+                                "pytorch": image_name_for_backend("pytorch"),
                             },
                         ]
                     )
@@ -1282,7 +1230,9 @@ updates for log_nu and params_flat""",
                             [
                                 {
                                     "current_container": image_name,
-                                    "next_container": pinn_image_name(other_backend),
+                                    "next_container": image_name_for_backend(
+                                        other_backend
+                                    ),
                                     "shared_host_loop": "JAX / Optax",
                                     "shared_objective": "data + physics + IC + BC",
                                 }

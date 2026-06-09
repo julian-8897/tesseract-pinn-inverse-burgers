@@ -69,7 +69,6 @@ notes/
 
 # FMPE training artifacts (trained posteriors, large)
 artifacts/
-_fmpe_calib.py
 tesseracts/fmpe_posterior/posterior.pkl
 HANDOFF_CODEX.md
 sbi-logs/

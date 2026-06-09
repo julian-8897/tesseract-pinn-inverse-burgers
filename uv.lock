@@ -1958,6 +1958,18 @@ wheels = [
 ]
 
 [[package]]
+name = "scienceplots"
+version = "2.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ae/a5/5f858668ca1a513033a7f0d55cd12b0940a12e822f9f61f317ce344e07c6/scienceplots-2.2.1.tar.gz", hash = "sha256:51ad98c420e499d3284d07b6447a4b3aedd8ec122aca39ba91c58205226c408a", size = 17966, upload-time = "2026-02-25T01:26:54.603Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cc/22/14e7b20f7d11f3e9ea9b5ae6acf9ea695c423eee785906cd5c5914a841dc/scienceplots-2.2.1-py3-none-any.whl", hash = "sha256:a1a9f670cbf5b59d92cdd3250be85b079ee4cf08bcaf2ace5ef57995be0b6c42", size = 30237, upload-time = "2026-02-25T01:26:53.298Z" },
+]
+
+[[package]]
 name = "scikit-learn"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2268,6 +2280,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "rich" },
     { name = "sbi" },
+    { name = "scienceplots" },
     { name = "seaborn" },
     { name = "streamlit" },
     { name = "tesseract-core", extra = ["runtime"] },
@@ -2288,6 +2301,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "rich", specifier = ">=14.2.0" },
     { name = "sbi", specifier = ">=0.26.1" },
+    { name = "scienceplots", specifier = ">=2.1.1" },
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "streamlit", specifier = ">=1.32.0" },
     { name = "tesseract-core", extras = ["runtime"], specifier = ">=1.2.0" },

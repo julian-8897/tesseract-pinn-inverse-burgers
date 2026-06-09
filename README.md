@@ -30,9 +30,9 @@ same physics and prints a unified table.
 **Key implementations:**
 - Three swappable, framework-agnostic Tesseracts: a JAX pseudospectral **solver**, a **PINN** with interchangeable JAX/PyTorch backends behind one `apply`/`vector_jacobian_product` contract, and an apply-only **FMPE posterior** sampler
 - Two differentiable inverse methods (solver-adjoint and PINN) compared on identical physics
-- Shared callback-driven training engines; measured Tesseract apply/VJP telemetry per gradient step
+- Shared strategy-driven training engine; measured complete-epoch Tesseract apply/VJP telemetry
 - Configurable loss weights, optional BRDR adaptive residual weighting, `log_nu` optimization, seeded runs, seed sweeps, reproducible artifacts
-- Amortized flow-matching posterior over `nu` for calibrated uncertainty, packaged as the third swappable Tesseract
+- Reproducible amortized flow-matching posterior over `(nu, ic_amp, ic_phase)`, packaged as the third swappable Tesseract with a versioned runtime contract
 
 ---
 
@@ -115,9 +115,9 @@ The inverse-training showcase exercises these `pinn_jax` and `pinn_pytorch` endp
 JVP endpoints are secondary to the current demo because the inverse trainer uses
 reverse-mode gradients through `jax.value_and_grad`. The `burgers_solver`
 Tesseract implements the same `apply`, VJP, and JVP endpoint pattern for
-differentiable solver runs. In the current inverse-problem demo it is used
-offline to generate ground-truth observations and visualization fields;
-differentiating through the solver during optimization is a planned extension.
+differentiable solver runs. `--mode solver-inverse` differentiates through its
+VJP during optimization; the same solver implementation also generates
+observations, FMPE simulations, and visualization fields.
 
 Input/output schemas use Tesseract's `Differentiable[Array[...]]` annotations to declare which fields participate in autodiff.
 
@@ -163,8 +163,9 @@ is delegated to callbacks:
 
 Each optimization step uses one `jax.value_and_grad` over `(log_nu, params)`.
 `TesseractCallCounter` wraps the `tesseract_jax` dispatch layer to report real
-container calls; the current inverse step measures 5 `apply` calls and 5 VJP
-calls per gradient step.
+container calls across the complete epoch. Counts include the optimization pass,
+optional BRDR pointwise-loss preparation, and periodic component-metric
+evaluation, so metric epochs can contain more `apply` calls than ordinary epochs.
 
 ### Configuration
 
@@ -175,6 +176,8 @@ Run settings live in validated typed dataclasses in `configs.py`:
 - `TrainingConfig`: epochs, learning rates, collocation/IC/BC sample counts, BRDR settings, optional viscosity warmup, and optional viscosity clipping
 - `LossWeights`: data, physics, initial-condition, and boundary-condition weights
 - `RunConfig`: full run configuration consumed by `inverse_problem.py`
+- `FMPEConfig`: simulation count, sensor count, noise, prior bounds, device, and
+  independent sensor/simulation/training seeds for posterior training
 
 The CLI exposes the common knobs directly. Internally, `inverse_problem.py`
 converts CLI arguments into a `RunConfig`, so Streamlit, tests, and figure
@@ -184,14 +187,18 @@ scripts call the same training path without duplicating defaults.
 
 ```
 tesseract-pinn-inverse-burgers/
-├── configs.py                 # Dataclass run/problem/data/training configs
-├── inverse_problem.py         # CLI demo comparing JAX/PyTorch backends
+├── configs.py                 # Deterministic inverse and FMPE configurations
+├── inverse_problem.py         # Deterministic inverse methods and shared engine
+├── fmpe_posterior.py          # FMPE simulation, training, bundles, diagnostics
 ├── app.py                     # Streamlit interactive interface
 ├── buildall.sh                # Builds Docker containers for all Tesseracts
 ├── Makefile                   # Common verification and demo commands
 ├── pyproject.toml
 ├── scripts/
-│   └── regenerate_figures.py  # Rebuilds README figures from current training path
+│   ├── fmpe_diagnostics.py    # SBC/TARP and contraction-study CLI
+│   ├── ml_plot_style.py       # Shared SciencePlots ML-publication style
+│   ├── plot_sbi_results.py    # Posterior and calibration figures
+│   └── regenerate_figures.py  # PINN figures from the current training path
 ├── tests/                     # Unit tests plus optional container smoke test
 └── tesseracts/
     ├── burgers_solver/
@@ -202,8 +209,12 @@ tesseract-pinn-inverse-burgers/
     │   ├── tesseract_api.py        # JAX/Equinox PINN with Tesseract endpoints
     │   ├── tesseract_config.yaml
     │   └── tesseract_requirements.txt
-    └── pinn_pytorch/
-        ├── tesseract_api.py        # PyTorch PINN with Tesseract endpoints
+    ├── pinn_pytorch/
+    │   ├── tesseract_api.py        # PyTorch PINN with Tesseract endpoints
+    │   ├── tesseract_config.yaml
+    │   └── tesseract_requirements.txt
+    └── fmpe_posterior/
+        ├── tesseract_api.py        # Validated apply-only posterior sampler
         ├── tesseract_config.yaml
         └── tesseract_requirements.txt
 ```
@@ -307,29 +318,69 @@ flow is packaged as the **third swappable Tesseract** (`fmpe_posterior`), alongs
 the JAX solver and the JAX/PyTorch PINN.
 
 ```bash
-# Train the posterior (simulation-based) and persist it for packaging
-uv run python fmpe_posterior.py train --n-sims 10000 --calibrate
+# Train deterministically and persist a versioned model bundle
+uv run python fmpe_posterior.py train --n-sims 10000 \
+  --sensor-seed 0 --simulation-seed 0 --training-seed 1
 
 # Build the posterior Tesseract (needs the trained posterior.pkl from `train`)
 uv run tesseract build tesseracts/fmpe_posterior
 
 # Query the posterior for an observation, via the container
 uv run python fmpe_posterior.py demo --tesseract --nu 0.05
+
+# Run SBC/TARP plus held-out coverage and contraction metrics
+uv run python -m scripts.fmpe_diagnostics calibrate \
+  --model tesseracts/fmpe_posterior/posterior.pkl
+
+# Retrain over a sensor/noise grid and write a contraction table
+uv run python -m scripts.fmpe_diagnostics contraction \
+  --sensor-counts 16 32 64 --noise-levels 0.01 0.02 0.05
 ```
 
-The posterior recovers `nu` with honest uncertainty (90% credible interval
-containing the truth) and is validated with **simulation-based calibration (SBC)**
-and **TARP coverage**. In the reference run the joint TARP coverage is calibrated
-and the IC-parameter marginals pass SBC; the `nu` marginal is mildly overconfident
-(SBC c2st ≈ 0.63) — reported honestly, a known characteristic of neural posterior
-estimators on the hardest marginal.
+Saved bundles contain the prior, expected observation length, parameter order,
+solver-grid contract, sensor-layout hash, training seeds, and a model identifier.
+Both the host loader and Tesseract reject incompatible observation vectors.
+
+Reference runs recover `nu` with the 90% credible interval containing truth,
+with calibrated joint TARP coverage and acceptable IC-parameter marginals. The
+`nu` marginal remains mildly overconfident (SBC c2st approximately 0.63), so the
+posterior should not be described as fully calibrated.
+
+### Publication figures
+
+Both figure scripts use `scripts/ml_plot_style.py`, a neutral ML-publication
+style built on SciencePlots. It provides compact single- and double-column
+dimensions, inward ticks, embedded PDF fonts, high-resolution PNG output, and
+basic validation for missing labels, plot titles, grids, and undersized lines.
+The dimensions and aspect ratios are intended for NeurIPS/ICML-style papers
+rather than a venue-specific journal template.
+
+```bash
+# SBI posterior, sensor layout, and calibration figures
+make plot-sbi
+
+# Rerender the exact saved posterior draw and include contraction diagnostics
+uv run python -m scripts.plot_sbi_results \
+  --samples-npz img/sbi/fmpe_posterior_samples.npz \
+  --calibration-report artifacts/fmpe_calibration.json \
+  --contraction-csv artifacts/fmpe_contraction.csv
+
+# Retrain both PINN backends and regenerate the deterministic comparison figures
+uv run python -m scripts.regenerate_figures \
+  --epochs 100 --seed 123 --nx 160 --nt 90
+```
+
+Every plotted figure is exported as both `.png` and `.pdf`. The SBI sample
+artifact records the exact posterior draw, truth, observation vector, sensor
+indices, model identifier, and query source used for rendering.
 
 ### Tests
 
 ```bash
 make compile
 make lint
-make test
+make test       # fast suite; excludes FMPE retraining
+make test-slow  # tiny end-to-end FMPE training smoke
 make smoke
 ```
 
@@ -339,22 +390,69 @@ local Tesseract images have not been built.
 ---
 
 ## Results
-The repository includes regenerated figures from the current solver-backed
-workflow. These were produced with `scripts/regenerate_figures.py` using both
-PINN Tesseract backends, 100 training epochs, seed 123, and a 160 x 90
-visualization grid.
+The repository includes regenerated SBI and deterministic PINN figures from the
+current implementation. All plots use the shared ML-publication style and are
+available as review PNGs and vector PDFs.
+
+### SBI posterior and diagnostics
+
+The FMPE posterior plot was generated by querying the packaged
+`fmpe_posterior` Tesseract. The calibration panel summarizes the tracked
+200-case reference evaluation. PDF versions are stored beside the PNG review
+copies.
 
 <table align="center" cellpadding="12">
   <tr>
     <td align="center">
-      <img src="img/pinn_solution_comparison.png" alt="Backend consistency dashboard comparing JAX and PyTorch PINN Tesseracts" width="900"/>
-      <div><em>Backend consistency dashboard: viscosity trajectory, objective loss, final estimates, backend spread, and measured apply/VJP calls.</em></div>
+      <img src="img/sbi/fmpe_posterior.png" alt="FMPE marginal and joint posterior over viscosity and initial-condition nuisance parameters" width="900"/>
+      <div><em>Posterior marginals and pairwise structure for a synthetic truth at ν=0.05, A<sub>IC</sub>=1, and φ<sub>IC</sub>=0. Dashed lines mark truth.</em></div>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="img/sbi/fmpe_calibration.png" alt="FMPE SBC, empirical coverage, and posterior contraction diagnostics" width="900"/>
+      <div><em>Reference-posterior diagnostics over 200 held-out simulations. The viscosity rank statistic shows the documented mild overconfidence.</em></div>
+    </td>
+  </tr>
+</table>
+
+The sensor-layout panel documents the fixed conditioning design. Panel (a)
+maps each sensor coordinate $(x_i,t_i)$ to its observed value. Panel (b) plots
+$u_{\mathrm{obs}}(x_i,t_i)$ against observation time and colors points by
+spatial position, avoiding an arbitrary sensor-index axis.
+
+<p align="center">
+  <img src="img/sbi/fmpe_sensor_observations.png" width="760"
+       alt="Fixed FMPE sensor locations and observed values plotted against time">
+  <br>
+  <em>Fixed FMPE conditioning layout and the corresponding observations as a function of sensor time.</em>
+</p>
+
+`img/sbi/fmpe_contraction.png` is an exploratory 1,000-simulation-per-setting
+sweep. It does not show monotonic contraction and should not be used as the
+headline calibration result; the script is intended for a larger production
+sweep.
+
+### Deterministic PINN comparison
+
+The deterministic figures were produced with both PINN Tesseract backends,
+100 training epochs, seed 123, and a 160 x 90 visualization grid. Both runs use
+the same observations, outer JAX/Optax optimizer, and inverse-problem
+configuration.
+
+<table align="center" cellpadding="12">
+  <tr>
+    <td align="center">
+      <img src="img/pinn_solution_comparison.png" alt="Four-panel backend comparison for JAX and PyTorch PINN Tesseracts" width="900"/>
+      <div><em>Backend comparison: viscosity trajectory, training objective, final viscosity estimates, and measured apply/VJP calls in the final epoch.</em></div>
     </td>
   </tr>
 </table>
 
 PINN $u(x,t)$ field reconstructions against the pseudospectral Burgers solver
-ground truth:
+ground truth. The PINN and solver panels share a symmetric field scale; the
+third panel reports pointwise absolute error. Equal axis scaling preserves the
+physical $(x,t)$ domain.
 
 <table align="center" cellpadding="12">
   <tr>
@@ -374,24 +472,28 @@ ground truth:
   </tr>
 </table>
 
-To regenerate these figures after training-path changes:
-
-```bash
-uv run python scripts/regenerate_figures.py --epochs 100 --seed 123 --nx 160 --nt 90
-```
+Vector versions: [backend comparison](img/pinn_solution_comparison.pdf),
+[JAX field](img/pinn_field_solution_jax.pdf),
+[PyTorch field](img/pinn_field_solution_pytorch.pdf),
+[FMPE posterior](img/sbi/fmpe_posterior.pdf),
+[sensor layout](img/sbi/fmpe_sensor_observations.pdf), and
+[calibration diagnostics](img/sbi/fmpe_calibration.pdf). The exploratory
+[contraction sweep](img/sbi/fmpe_contraction.pdf) is also available separately.
 
 ## Current Status
 
 - Two differentiable inverse methods: **solver-adjoint** (`--mode solver-inverse`, `jax.grad` through the solver VJP) and **PINN** (`--mode pinn`, `jax.grad` through the PINN VJP); `--mode compare` tabulates both.
 - For scalar viscosity inversion the solver-adjoint method is dramatically more accurate and cheaper per step than the PINN; the PINN is mesh-free and needs no solver but converges more slowly. The two PINN backends (JAX, PyTorch) agree, demonstrating backend-agnostic consistency.
-- Each step uses one `jax.value_and_grad`; Tesseract apply/VJP counts are measured through the `tesseract_jax` dispatch layer.
+- Each step uses one `jax.value_and_grad`; complete-epoch Tesseract apply/VJP counts are measured through the `tesseract_jax` dispatch layer.
 - Loss weights can be fixed or adapted with opt-in BRDR pointwise residual weighting; the CLI and Streamlit app share callback-driven training engines.
+- Stage B SBI is implemented: FMPE jointly infers `(nu, ic_amp, ic_phase)`, supports deterministic training, emits a validated versioned model bundle, and has tracked SBC/TARP and contraction tooling.
 - Container smoke coverage verifies `Tesseract.from_image(...)` through `apply` and VJP when local images are available; reproducible artifacts and figures are supported.
 
 ## Limitations and Roadmap
 
-- **Frontier UQ:** an amortized **flow-matching posterior** over `nu` (a third swappable Tesseract) provides calibrated uncertainty and is validated with simulation-based calibration / coverage. The trained `posterior.pkl` is reproducible via `python fmpe_posterior.py train` and is intentionally not committed.
-- **Single scalar parameter inversion:** the inverse target is viscosity `nu` only; joint inference of initial-condition parameters is a natural extension.
+- **FMPE calibration caveat:** Stage B posterior inference is implemented, but the `nu` marginal is mildly overconfident in reference SBC diagnostics. Joint TARP coverage and the IC marginals are stronger.
+- **Point-estimate scope:** deterministic inversion still optimizes only viscosity `nu`; the FMPE posterior already treats `ic_amp` and `ic_phase` as nuisance parameters and infers all three jointly.
+- **Optional Stage C:** solver-gradient refinement of FMPE samples through the solver VJP has not been implemented.
 - **Model-misspecification sidebar (experimental):** a KdV-Burgers truth oracle (`solve_kdv_burgers`) plus a learned-discrepancy hybrid (`train_hybrid_inverse`) are included to *demonstrate* a known failure mode — naive calibration-with-discrepancy is confounded with the calibration parameter and biases it (Brynjarsdóttir & O'Hagan, 2014). This is documented as a limitation, not a headline result, and motivates the posterior treatment above.
 - **No checkpointing; PINN model reconstructed from `params_flat` per call.**
 

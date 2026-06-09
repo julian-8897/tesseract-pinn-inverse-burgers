@@ -5,6 +5,7 @@ smoke trains a tiny FMPE posterior and checks the sampling interface; it is mark
 ``slow`` so the default suite stays quick.
 """
 
+import importlib.util
 import pathlib
 import sys
 
@@ -16,6 +17,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 import fmpe_posterior as fp  # noqa: E402
+from configs import FMPEConfig  # noqa: E402
 
 
 def test_prior_ranges():
@@ -54,6 +56,144 @@ def test_observation_from_theta_shape():
     x_o = fp.observation_from_theta((0.05, 1.0, 0.0), sensors)
     assert x_o.shape == (1, 40)
     assert torch.isfinite(x_o).all()
+
+
+def test_fmpe_simulation_is_reproducible_from_config():
+    config = FMPEConfig(
+        n_sims=8,
+        n_sensors=12,
+        sensor_seed=2,
+        simulation_seed=3,
+        training_seed=4,
+        max_num_epochs=1,
+    )
+    prior = fp.default_prior()
+
+    torch.manual_seed(config.simulation_seed)
+    theta_a = prior.sample((config.n_sims,))
+    sensors_a = fp.Sensors(config.n_sensors, seed=config.sensor_seed)
+    x_a = fp.simulate(
+        theta_a, sensors_a, noise_std=config.noise_std, seed=config.simulation_seed
+    )
+
+    torch.manual_seed(config.simulation_seed)
+    theta_b = prior.sample((config.n_sims,))
+    sensors_b = fp.Sensors(config.n_sensors, seed=config.sensor_seed)
+    x_b = fp.simulate(
+        theta_b, sensors_b, noise_std=config.noise_std, seed=config.simulation_seed
+    )
+
+    assert torch.equal(theta_a, theta_b)
+    assert torch.equal(x_a, x_b)
+    assert np.array_equal(sensors_a.x_idx, sensors_b.x_idx)
+
+
+def test_saved_bundle_has_versioned_contract_and_validates_observations(tmp_path):
+    sensors = fp.Sensors(n_sensors=10, seed=7)
+    result = {
+        "posterior": object(),
+        "sensors": sensors,
+        "noise_std": 0.02,
+        "config": FMPEConfig(n_sims=20, n_sensors=10),
+    }
+    path = fp.save_model(result, tmp_path / "posterior.pkl")
+    bundle = fp.load_model(path, allow_legacy=False)
+
+    metadata = bundle["metadata"]
+    assert metadata["format"] == fp.BUNDLE_FORMAT
+    assert metadata["version"] == fp.BUNDLE_VERSION
+    assert metadata["contract"]["observation_dim"] == 10
+    assert metadata["contract"]["sensor_layout_id"] == sensors.layout_id
+    assert len(metadata["model_id"]) == 64
+
+    observation = fp.validate_observation(np.zeros(10), bundle)
+    assert observation.dtype == np.float32
+    with pytest.raises(ValueError, match="model expects 10"):
+        fp.validate_observation(np.zeros(9), bundle)
+    with pytest.raises(ValueError, match="finite"):
+        fp.validate_observation(np.full(10, np.nan), bundle)
+
+
+def test_legacy_bundle_requires_explicit_compatibility():
+    sensors = fp.Sensors(n_sensors=6, seed=0)
+    legacy = {
+        "posterior": object(),
+        "x_idx": np.asarray(sensors.x_idx),
+        "t_idx": np.asarray(sensors.t_idx),
+        "noise_std": 0.02,
+    }
+
+    migrated = fp.validate_model_bundle(legacy)
+    assert migrated["metadata"]["legacy"] is True
+    with pytest.raises(ValueError, match="no versioned metadata"):
+        fp.validate_model_bundle(legacy, allow_legacy=False)
+
+
+def test_posterior_summary_reports_coverage_and_contraction():
+    truths = np.array([[0.05, 1.0, 0.0], [0.06, 0.9, 0.1]])
+    offsets = np.linspace(-1.0, 1.0, 101)
+    samples = np.stack(
+        [
+            truths[case] + offsets[:, None] * np.array([0.005, 0.02, 0.02])
+            for case in range(2)
+        ]
+    )
+
+    summary = fp.summarize_posterior_samples(samples, truths)
+
+    assert summary["parameters"]["nu"]["coverage"] == 1.0
+    assert summary["parameters"]["nu"]["rmse"] == pytest.approx(0.0, abs=1e-8)
+    assert 0.0 < summary["parameters"]["nu"]["contraction_ratio"] < 1.0
+
+
+def test_diagnostic_reports_are_machine_readable(tmp_path):
+    report_path = fp.write_json_report(
+        {"tensor": torch.tensor([1.0, 2.0])}, tmp_path / "report.json"
+    )
+    csv_path = fp.write_contraction_csv(
+        [{"n_sensors": 16, "nu_coverage": 0.9}],
+        tmp_path / "contraction.csv",
+    )
+
+    assert '"tensor": [' in report_path.read_text()
+    assert "nu_coverage" in csv_path.read_text()
+
+
+def test_tesseract_runtime_rejects_wrong_observation_length():
+    module_path = REPO_ROOT / "tesseracts" / "fmpe_posterior" / "tesseract_api.py"
+    spec = importlib.util.spec_from_file_location(
+        "fmpe_tesseract_api_test", module_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class FakePosterior:
+        def sample(self, shape, x, show_progress_bars=False):
+            return torch.zeros((shape[0], 3), dtype=torch.float32)
+
+    model = {
+        "posterior": FakePosterior(),
+        "x_idx": np.arange(4),
+        "t_idx": np.arange(4),
+        "metadata": {
+            "format": module.BUNDLE_FORMAT,
+            "version": module.BUNDLE_VERSION,
+            "model_id": "test-model",
+            "contract": {"observation_dim": 4},
+        },
+    }
+    module._validate_model(model)
+    module._MODEL = model
+
+    output = module.apply(
+        module.InputSchema(observation=np.zeros(4, dtype=np.float32), seed=0)
+    )
+    assert output.observation_dim == 4
+    assert output.model_id == "test-model"
+    with pytest.raises(ValueError, match="model expects 4"):
+        module.apply(
+            module.InputSchema(observation=np.zeros(3, dtype=np.float32), seed=0)
+        )
 
 
 def test_posterior_tesseract_container():

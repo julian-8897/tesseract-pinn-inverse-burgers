@@ -23,6 +23,7 @@ from typing import NamedTuple
 import diffrax
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import torch
 from rich.console import Console
@@ -363,6 +364,42 @@ def get_burgers_solver():
             sys.modules["tesseract_api"] = previous_module
 
     return solve_burgers
+
+
+def evaluate_pinn_solution_grid(
+    true_viscosity,
+    params_flat,
+    pinn,
+    nx=128,
+    nt=64,
+    *,
+    ic_amp=1.0,
+    ic_phase=0.0,
+):
+    """Evaluate a PINN and the Burgers solver on one visualization grid."""
+    x = np.linspace(0.0, 1.0, nx, endpoint=False, dtype=np.float32)
+    t = np.linspace(0.0, 1.0, nt, dtype=np.float32)
+    x_grid, t_grid = np.meshgrid(x, t)
+
+    result = apply_tesseract(
+        pinn,
+        {
+            "x": jnp.asarray(x_grid.ravel(), dtype=jnp.float32),
+            "t": jnp.asarray(t_grid.ravel(), dtype=jnp.float32),
+            "params_flat": params_flat,
+        },
+    )
+    u_pred = np.asarray(result["u_pred"]).reshape(nt, nx)
+
+    solve_burgers = get_burgers_solver()
+    u_solver = solve_burgers(
+        jnp.asarray(true_viscosity, dtype=jnp.float32),
+        jnp.asarray(x, dtype=jnp.float32),
+        jnp.asarray(t, dtype=jnp.float32),
+        jnp.asarray(ic_amp, dtype=jnp.float32),
+        jnp.asarray(ic_phase, dtype=jnp.float32),
+    )
+    return x_grid, t_grid, u_pred, np.asarray(u_solver)
 
 
 def get_initial_params(backend="jax", seed=42):
@@ -1025,18 +1062,15 @@ def _loss_from_log_and_params(
 
 @dataclass
 class StepResult:
-    """Telemetry from one optimization step (everything bar the log_nu update).
+    """Mode-specific values from one optimization step.
 
-    The strategy computes the step (the counted backward pass plus any auxiliary
-    parameter update); the engine consumes ``log_v_grad`` to advance ``log_nu``
-    and the rest to build the ``EpochRecord``.
+    The engine consumes ``log_v_grad`` to advance ``log_nu`` and combines the
+    remaining values with complete-epoch Tesseract call telemetry.
     """
 
     loss: float
     log_v_grad: object
     param_grad_norm: float
-    apply_calls: int
-    vjp_calls: int
     effective_weights: dict
     param_count: int
     brdr_weights: object | None = None
@@ -1067,7 +1101,7 @@ class InverseStrategy(ABC):
 
     @abstractmethod
     def run_step(self, log_viscosity, epoch: int) -> StepResult:
-        """Run one counted backward pass, update auxiliary params, return telemetry."""
+        """Run one backward pass, update auxiliary params, and return step values."""
 
     @abstractmethod
     def epoch_loss_components(self, viscosity, log_viscosity, step, record):
@@ -1093,7 +1127,6 @@ class PINNStrategy(InverseStrategy):
         if self.training.adaptive_loss_weights:
             validate_brdr_loss_weights(self.loss_weights)
 
-        self.counter = TesseractCallCounter()
         self.inputs = build_training_inputs(config)
         self.image_name = image_name_for_backend(self.backend)
         self.owns_pinn = pinn is None
@@ -1157,22 +1190,20 @@ class PINNStrategy(InverseStrategy):
             brdr_weights = self.brdr_state["weights"]
 
         # One reverse-mode sweep yields the loss and both gradients.
-        self.counter.reset()
-        with count_tesseract_calls(self.counter):
-            loss, (log_v_grad, p_grad) = self.loss_and_grads(
-                log_viscosity,
-                self.params_flat,
-                x_obs,
-                t_obs,
-                u_obs,
-                x_col,
-                t_col,
-                x_ic,
-                t_bc,
-                self.pinn,
-                brdr_weights,
-                self.loss_weights,
-            )
+        loss, (log_v_grad, p_grad) = self.loss_and_grads(
+            log_viscosity,
+            self.params_flat,
+            x_obs,
+            t_obs,
+            u_obs,
+            x_col,
+            t_col,
+            x_ic,
+            t_bc,
+            self.pinn,
+            brdr_weights,
+            self.loss_weights,
+        )
 
         param_updates, self.param_opt_state = self.param_optimizer.update(
             p_grad, self.param_opt_state
@@ -1191,8 +1222,6 @@ class PINNStrategy(InverseStrategy):
             loss=float(loss),
             log_v_grad=log_v_grad,
             param_grad_norm=float(jnp.linalg.norm(p_grad)),
-            apply_calls=self.counter.apply_calls,
-            vjp_calls=self.counter.vjp_calls,
             effective_weights=effective_weights,
             param_count=int(self.params_flat.size),
             brdr_weights=brdr_weights,
@@ -1251,6 +1280,7 @@ def _run_inverse_training(config, strategy, *, callback=None, metrics_every=20):
     data_config = config.data
     training = config.training
     callback = callback or TrainingCallback()
+    counter = TesseractCallCounter()
 
     log_viscosity = jnp.log(jnp.asarray(problem.initial_viscosity))
     log_nu_bounds = None
@@ -1276,30 +1306,35 @@ def _run_inverse_training(config, strategy, *, callback=None, metrics_every=20):
 
         for epoch in range(training.n_epochs):
             start_time = time.time()
+            record = epoch % metrics_every == 0 or epoch == training.n_epochs - 1
+            counter.reset()
 
-            step = strategy.run_step(log_viscosity, epoch)
+            # Count the complete epoch: adaptive-weight preparation, gradient pass,
+            # and any periodic loss-component evaluation.
+            with count_tesseract_calls(counter):
+                step = strategy.run_step(log_viscosity, epoch)
 
-            viscosity_updated = epoch >= warmup_epochs
-            if viscosity_updated:
-                updates, log_visc_opt_state = log_visc_optimizer.update(
-                    step.log_v_grad, log_visc_opt_state
-                )
-                log_viscosity = optax.apply_updates(log_viscosity, updates)
-                if log_nu_bounds is not None:
-                    log_viscosity = jnp.clip(
-                        log_viscosity, log_nu_bounds[0], log_nu_bounds[1]
+                viscosity_updated = epoch >= warmup_epochs
+                if viscosity_updated:
+                    updates, log_visc_opt_state = log_visc_optimizer.update(
+                        step.log_v_grad, log_visc_opt_state
                     )
-            viscosity = jnp.exp(log_viscosity)
+                    log_viscosity = optax.apply_updates(log_viscosity, updates)
+                    if log_nu_bounds is not None:
+                        log_viscosity = jnp.clip(
+                            log_viscosity, log_nu_bounds[0], log_nu_bounds[1]
+                        )
+                viscosity = jnp.exp(log_viscosity)
+
+                components = strategy.epoch_loss_components(
+                    viscosity, log_viscosity, step, record
+                )
 
             epoch_time = time.time() - start_time
             times.append(epoch_time)
             viscosity_history.append(float(viscosity))
             log_viscosity_history.append(float(log_viscosity))
 
-            record = epoch % metrics_every == 0 or epoch == training.n_epochs - 1
-            components = strategy.epoch_loss_components(
-                viscosity, log_viscosity, step, record
-            )
             if record and components is not None:
                 for name in loss_history:
                     loss_history[name].append(components[name])
@@ -1314,8 +1349,8 @@ def _run_inverse_training(config, strategy, *, callback=None, metrics_every=20):
                     visc_grad_norm=float(jnp.abs(step.log_v_grad)),
                     param_grad_norm=step.param_grad_norm,
                     epoch_time=epoch_time,
-                    apply_calls=step.apply_calls,
-                    vjp_calls=step.vjp_calls,
+                    apply_calls=counter.apply_calls,
+                    vjp_calls=counter.vjp_calls,
                     effective_weights=step.effective_weights,
                     viscosity_updated=viscosity_updated,
                     param_count=step.param_count,
@@ -1461,8 +1496,6 @@ class HybridDiscrepancyStrategy(InverseStrategy):
             "reg": self.w_reg,
             "smooth": self.w_smooth,
         }
-        self.counter = TesseractCallCounter()
-
         domain = self.problem.domain
         key = jax.random.PRNGKey(self.data_config.seed)
         key_obs, key_reg_x, key_reg_t = jax.random.split(key, 3)
@@ -1519,20 +1552,18 @@ class HybridDiscrepancyStrategy(InverseStrategy):
         }
 
     def run_step(self, log_viscosity, epoch):
-        self.counter.reset()
-        with count_tesseract_calls(self.counter):
-            (loss, components), (log_v_grad, p_grad) = self.loss_and_grads(
-                log_viscosity,
-                self.params_flat,
-                self.obs,
-                self.x_reg,
-                self.t_reg,
-                self.solver,
-                self.pinn,
-                self.w_data,
-                self.w_reg,
-                self.w_smooth,
-            )
+        (loss, components), (log_v_grad, p_grad) = self.loss_and_grads(
+            log_viscosity,
+            self.params_flat,
+            self.obs,
+            self.x_reg,
+            self.t_reg,
+            self.solver,
+            self.pinn,
+            self.w_data,
+            self.w_reg,
+            self.w_smooth,
+        )
 
         param_updates, self.param_opt_state = self.param_optimizer.update(
             p_grad, self.param_opt_state
@@ -1543,8 +1574,6 @@ class HybridDiscrepancyStrategy(InverseStrategy):
             loss=float(loss),
             log_v_grad=log_v_grad,
             param_grad_norm=float(jnp.linalg.norm(p_grad)),
-            apply_calls=self.counter.apply_calls,
-            vjp_calls=self.counter.vjp_calls,
             effective_weights=self.effective_weights,
             param_count=int(self.params_flat.size),
             aux={name: float(value) for name, value in components.items()},
@@ -1614,8 +1643,6 @@ class SolverAdjointStrategy(InverseStrategy):
         self.config = config
         self.problem = config.problem
         self.data_config = config.data
-        self.counter = TesseractCallCounter()
-
         key = jax.random.PRNGKey(self.data_config.seed)
         self.obs = generate_grid_observations(
             self.data_config.n_obs,
@@ -1644,15 +1671,11 @@ class SolverAdjointStrategy(InverseStrategy):
         }
 
     def run_step(self, log_viscosity, epoch):
-        self.counter.reset()
-        with count_tesseract_calls(self.counter):
-            loss, log_v_grad = self.loss_and_grad(log_viscosity, self.obs, self.solver)
+        loss, log_v_grad = self.loss_and_grad(log_viscosity, self.obs, self.solver)
         return StepResult(
             loss=float(loss),
             log_v_grad=log_v_grad,
             param_grad_norm=0.0,
-            apply_calls=self.counter.apply_calls,
-            vjp_calls=self.counter.vjp_calls,
             effective_weights={},
             param_count=0,
         )
