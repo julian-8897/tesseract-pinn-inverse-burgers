@@ -95,8 +95,8 @@ The posterior method needs one extra step, `make train-posterior`, covered in
 - [Installation](#installation)
 - [Usage](#usage)
 - [Results](#results)
-- [Current status](#current-status)
-- [Limitations and roadmap](#limitations-and-roadmap)
+- [What works today](#what-works-today)
+- [Limitations and what's next](#limitations-and-whats-next)
 - [References](#references)
 
 ---
@@ -134,7 +134,7 @@ where:
 
 ## Implementation
 
-### Architecture
+### The PINN network
 
 The PINN uses fixed Fourier feature encoding to mitigate spectral bias:
 
@@ -156,15 +156,15 @@ $\partial^2 u/\partial x^2$) are computed via automatic differentiation within
 each Tesseract using the native framework's autograd: `jax.grad` for the JAX
 backend and `torch.autograd.grad` for the PyTorch backend.
 
-### Tesseract Endpoints
+### What each Tesseract exposes
 
-The inverse-training showcase exercises these `pinn_jax` and `pinn_pytorch` endpoints:
+Both PINN containers (`pinn_jax` and `pinn_pytorch`) expose the same two endpoints:
 
-1. **apply(inputs)**: Forward pass returning u_pred, u_x, u_t, u_xx
-2. **vector_jacobian_product(...)**: Reverse-mode AD for gradient computation
+1. `apply(inputs)`: the forward pass, returning `u_pred`, `u_x`, `u_t`, and `u_xx`.
+2. `vector_jacobian_product(...)`: reverse-mode AD for the gradient.
 
-JVP endpoints are secondary to the current demo because the inverse trainer uses
-reverse-mode gradients through `jax.value_and_grad`. The `burgers_solver`
+The inverse trainer uses reverse-mode gradients through `jax.value_and_grad`, so
+the JVP endpoints stay idle here. The `burgers_solver`
 Tesseract implements the same `apply`, VJP, and JVP endpoint pattern for
 differentiable solver runs. `--mode solver-inverse` differentiates through its
 VJP during optimization; the same solver implementation also generates
@@ -172,7 +172,7 @@ observations, FMPE simulations, and visualization fields.
 
 Input/output schemas use Tesseract's `Differentiable[Array[...]]` annotations to declare which fields participate in autodiff.
 
-### Cross-Framework Gradient Flow
+### How a JAX gradient reaches PyTorch
 
 The CLI path in `inverse_problem.py` optimizes the viscosity in log space:
 
@@ -202,7 +202,7 @@ The inverse loop optimizes `log_nu` and evaluates the PDE residual with
 viscosity clipping and viscosity warmup are available through `TrainingConfig`
 and the Streamlit app for more stable interactive runs.
 
-### Shared Training Engine
+### One engine, many front ends
 
 `inverse_problem.py` exposes `train_inverse(config, *, pinn=None, callback=None,
 metrics_every=20)`. Both the CLI and Streamlit UI call this function. Presentation
@@ -234,7 +234,7 @@ The CLI exposes the common knobs directly. Internally, `inverse_problem.py`
 converts CLI arguments into a `RunConfig`, so Streamlit, tests, and figure
 scripts call the same training path without duplicating defaults.
 
-### Project Structure
+### Repository layout
 
 ```
 tesseract-pinn-inverse-burgers/
@@ -542,34 +542,52 @@ Vector versions: [backend comparison](img/pinn_solution_comparison.pdf),
 [calibration diagnostics](img/sbi/fmpe_calibration.pdf). The exploratory
 [contraction sweep](img/sbi/fmpe_contraction.pdf) is also available separately.
 
-## Current Status
+## What works today
 
-- Two differentiable inverse methods: **solver-adjoint** (`--mode solver-inverse`, `jax.grad` through the solver VJP) and **PINN** (`--mode pinn`, `jax.grad` through the PINN VJP); `--mode compare` tabulates both.
-- For scalar viscosity inversion the solver-adjoint method is much more accurate and cheaper per step than the PINN. The PINN needs no solver at inference but converges slower. The JAX and PyTorch PINN backends agree, which is the backend-agnostic consistency check.
-- Each step uses one `jax.value_and_grad`; complete-epoch Tesseract apply/VJP counts are measured through the `tesseract_jax` dispatch layer.
-- Loss weights can be fixed or adapted with opt-in BRDR pointwise residual weighting; the CLI and Streamlit app share callback-driven training engines.
-- Stage B SBI is implemented: FMPE jointly infers `(nu, ic_amp, ic_phase)`, supports deterministic training, emits a validated versioned model bundle, and has tracked SBC/TARP and contraction tooling.
-- Container smoke coverage verifies `Tesseract.from_image(...)` through `apply` and VJP when local images are available; reproducible artifacts and figures are supported.
+- Two differentiable inverse methods run end to end: solver-adjoint (`--mode solver-inverse`, `jax.grad` through the solver VJP) and PINN (`--mode pinn`, `jax.grad` through the PINN VJP). `--mode compare` tabulates both.
+- On scalar viscosity, solver-adjoint is more accurate and cheaper per step than the PINN. The PINN needs no solver at inference but converges slower. The JAX and PyTorch PINN backends land on the same answer, which is the backend-agnostic consistency check.
+- Each step takes one `jax.value_and_grad`, and the `tesseract_jax` dispatch layer measures the real apply/VJP counts across the full epoch.
+- Loss weights are fixed by default, with opt-in pointwise (BRDR) residual weighting. The CLI and the Streamlit app share the same callback-driven engines.
+- The FMPE posterior infers `(nu, ic_amp, ic_phase)` jointly, trains deterministically, writes a versioned model bundle, and ships SBC/TARP and contraction tooling.
+- A container smoke test exercises `Tesseract.from_image(...)` through `apply` and VJP when the images are built, and the figures and benchmark artifacts regenerate from one command.
 
-## Limitations and Roadmap
+## Limitations and what's next
 
-- **FMPE calibration caveat:** Stage B posterior inference is implemented, but the `nu` marginal is mildly overconfident in reference SBC diagnostics. Joint TARP coverage and the IC marginals are stronger.
-- **Point-estimate scope:** deterministic inversion still optimizes only viscosity `nu`; the FMPE posterior already treats `ic_amp` and `ic_phase` as nuisance parameters and infers all three jointly.
-- **Optional Stage C:** solver-gradient refinement of FMPE samples through the solver VJP has not been implemented.
-- **Model-misspecification sidebar (experimental):** a KdV-Burgers truth oracle (`solve_kdv_burgers`) plus a learned-discrepancy hybrid (`train_hybrid_inverse`) are included to *demonstrate* a known failure mode: naive calibration-with-discrepancy is confounded with the calibration parameter and biases it (Brynjarsdóttir & O'Hagan, 2014). This is documented as a limitation, not a headline result, and motivates the posterior treatment above.
-- **No checkpointing; PINN model reconstructed from `params_flat` per call.**
+- **The ν marginal is overconfident.** The posterior works and is usable, but reference SBC shows its viscosity marginal too narrow (c2st ≈ 0.63). Joint TARP coverage and the two initial-condition marginals hold up better. Read the ν interval as a lower bound on its true width.
+- **The deterministic methods infer one scalar.** Solver-adjoint and PINN recover only ν. The FMPE posterior already treats `ic_amp` and `ic_phase` as nuisance parameters and infers all three at once.
+- **No posterior refinement yet.** Polishing FMPE samples with a few solver-VJP gradient steps, a single honest `flow ∘ solver` pass, is not implemented.
+- **The misspecification sidebar is a documented failure, not a feature.** A KdV-Burgers truth oracle (`solve_kdv_burgers`) and a learned-discrepancy hybrid (`train_hybrid_inverse`) show a known trap: a free-form discrepancy term is confounded with the calibration parameter and biases it (Brynjarsdóttir & O'Hagan, 2014). It motivates the posterior treatment rather than competing with it.
+- **No checkpointing.** Each `apply`/VJP call rebuilds the PINN from its flat parameter vector.
 
 ## References
 
-**Tesseract Documentation:**
-- [Tesseract Core](https://github.com/pasteurlabs/tesseract-core) - Main repository and CLI
-- [Tesseract-JAX](https://github.com/pasteurlabs/tesseract-jax) - JAX integration layer
-- [Creating Tesseracts](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/content/creating-tesseracts/create.html) - Implementation guide
-- [Differentiable Programming](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/content/introduction/differentiable-programming.html) - VJP/JVP concepts
+**Tesseract**
+- [Tesseract Core](https://github.com/pasteurlabs/tesseract-core): runtime and CLI
+- [Tesseract-JAX](https://github.com/pasteurlabs/tesseract-jax): JAX integration layer
+- [Creating Tesseracts](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/content/creating-tesseracts/create.html): implementation guide
+- [Differentiable programming in Tesseract](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/content/introduction/differentiable-programming.html): VJP/JVP concepts
 
-**Related Publications to PINNs:**
-- Raissi, M., Perdikaris, P., & Karniadakis, G. E., ["Physics-informed neural networks: A deep learning framework for solving forward and inverse problems involving nonlinear partial differential equations"](https://www.sciencedirect.com/science/article/pii/S0021999118307125), *Journal of Computational Physics* 378 (2019): 686-707
-- Tancik, M., Srinivasan, P. P., Mildenhall, B., Fridovich-Keil, S., Raghavan, N., Singhal, U., Ramamoorthi, R., & Ng, R., ["Fourier Features Let Networks Learn High Frequency Functions in Low Dimensional Domains"](https://arxiv.org/abs/2006.10739), *NeurIPS* 2020
+**Physics-informed neural networks**
+- Raissi, Perdikaris & Karniadakis (2019), ["Physics-informed neural networks"](https://www.sciencedirect.com/science/article/pii/S0021999118307125), *Journal of Computational Physics* 378:686-707. The PINN forward/inverse formulation this repo follows.
+- Tancik et al. (2020), ["Fourier Features Let Networks Learn High Frequency Functions in Low Dimensional Domains"](https://arxiv.org/abs/2006.10739), *NeurIPS*. The fixed Fourier encoding on the PINN input.
+- Wang, Teng & Perdikaris (2021), ["Understanding and mitigating gradient pathologies in physics-informed neural networks"](https://arxiv.org/abs/2001.04536), *SIAM J. Sci. Comput.* Why PINN loss terms need balancing.
+- McClenny & Braga-Neto (2023), ["Self-adaptive physics-informed neural networks"](https://arxiv.org/abs/2009.04544), *Journal of Computational Physics* 474:111722. Background for the optional pointwise (BRDR) residual weighting.
+
+**Simulation-based inference and flow matching**
+- Cranmer, Brehmer & Louppe (2020), ["The frontier of simulation-based inference"](https://arxiv.org/abs/1911.01429), *PNAS* 117(48):30055-30062. The SBI setting the posterior method sits in.
+- Tejero-Cantero et al. (2020), ["sbi: a toolkit for simulation-based inference"](https://joss.theoj.org/papers/10.21105/joss.02505), *JOSS* 5(52):2505. The library used to train the posterior.
+- Lipman et al. (2023), ["Flow Matching for Generative Modeling"](https://arxiv.org/abs/2210.02747), *ICLR*. The generative model class behind FMPE.
+- Dax et al. (2023), ["Flow Matching for Scalable Simulation-Based Inference"](https://arxiv.org/abs/2305.17161), *NeurIPS*. Flow matching as a posterior estimator (FMPE).
+
+**Calibration and model discrepancy**
+- Talts, Betancourt, Simpson, Vehtari & Gelman (2018), ["Validating Bayesian Inference Algorithms with Simulation-Based Calibration"](https://arxiv.org/abs/1804.06788). The SBC rank test used here.
+- Lemos, Coogan, Hezaveh & Perreault-Levasseur (2023), ["Sampling-Based Accuracy Testing of Posterior Estimators for General Inference"](https://arxiv.org/abs/2302.03026), *ICML*. The TARP coverage test used here.
+- Kennedy & O'Hagan (2001), ["Bayesian calibration of computer models"](https://doi.org/10.1111/1467-9868.00294), *JRSS B* 63(3):425-464.
+- Brynjarsdóttir & O'Hagan (2014), ["Learning about physical parameters: the importance of model discrepancy"](https://doi.org/10.1088/0266-5611/30/11/114007), *Inverse Problems* 30(11):114007. Why the misspecification sidebar fails as documented.
+
+**Tooling**
+- Kidger (2021), ["On Neural Differential Equations"](https://arxiv.org/abs/2202.02435), PhD thesis, University of Oxford. The Diffrax integrator behind the solver.
+- [zuko](https://github.com/probabilists/zuko): normalizing flows in PyTorch, the density used inside the FMPE posterior.
 
 ---
 
