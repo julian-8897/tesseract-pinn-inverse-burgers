@@ -1,4 +1,4 @@
-# Backend-Agnostic Inverse Burgers with Tesseract
+# Inverse Burgers with Tesseract
 
 [![tesseract-core v1.2.0](https://img.shields.io/badge/tesseract--core-v1.2.0-blue)](https://github.com/pasteurlabs/tesseract-core)
 [![tesseract-jax v0.2.3](https://img.shields.io/badge/tesseract--jax-v0.2.3-green)](https://github.com/pasteurlabs/tesseract-jax)
@@ -7,52 +7,90 @@
 [![Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-orange.svg)](LICENSE)
 [![CI](https://github.com/julian-8897/tesseract-pinn-inverse-burgers/actions/workflows/ci.yml/badge.svg)](https://github.com/julian-8897/tesseract-pinn-inverse-burgers/actions/workflows/ci.yml)
 
-**Overview**
-This project estimates the viscosity coefficient of the 1D viscous Burgers
-equation from sparse noisy observations, and showcases **Tesseract as a registry
-of framework-agnostic, swappable, differentiable model components**. The physics
-solver, the PINN surrogate, and the posterior sampler are each packaged as
-an independent Tesseract behind one uniform typed schema — so you swap a JAX
-component for a PyTorch one by changing an image name, with identical calling
-code and no shared environment.
+Recover the viscosity of a fluid from sparse, noisy measurements, three different
+ways, with each method packaged as a swappable
+[Tesseract](https://github.com/pasteurlabs/tesseract-core) component.
 
-The inverse problem is solved two ways, both differentiating through a Tesseract:
+<p align="center">
+  <img src="img/sbi/fmpe_posterior.png" width="640"
+       alt="Posterior over the Burgers viscosity and the two initial-condition parameters">
+  <br>
+  <em>The headline result: an amortized posterior over the viscosity and the initial
+  wave, inferred from a single sparse observation. Dashed lines mark the truth.</em>
+</p>
 
-- **Solver-adjoint inversion** (`--mode solver-inverse`): `jax.grad` flows through
-  the differentiable **solver** Tesseract's VJP — a PDE-constrained baseline.
-- **PINN inversion** (`--mode pinn`): `jax.grad` flows through the **PINN**
-  Tesseract's VJP, with the PINN backend interchangeable between **JAX and
-  PyTorch** (the backend-agnostic showcase).
+## What this is
 
-`--mode compare` runs all three (solver-adjoint, PINN-JAX, PINN-PyTorch) on the
-same physics and prints a unified table.
+You are given noisy measurements of a 1D fluid that follows the viscous Burgers
+equation. One number in the equation is unknown: the viscosity ν, which sets how fast
+sharp fronts smear out. The job is to recover ν from the data, and for the last method
+the shape of the initial wave as well.
 
-**Key implementations:**
-- Three swappable, framework-agnostic Tesseracts: a JAX pseudospectral **solver**, a **PINN** with interchangeable JAX/PyTorch backends behind one `apply`/`vector_jacobian_product` contract, and an apply-only **FMPE posterior** sampler
-- Two differentiable inverse methods (solver-adjoint and PINN) compared on identical physics
-- Shared strategy-driven training engine; measured complete-epoch Tesseract apply/VJP telemetry
-- Configurable loss weights, optional BRDR adaptive residual weighting, `log_nu` optimization, seeded runs, seed sweeps, reproducible artifacts
-- Reproducible amortized flow-matching posterior over `(nu, ic_amp, ic_phase)`, packaged as the third swappable Tesseract with a versioned runtime contract
+This repo solves that inverse problem three ways, from simplest to most capable. Each
+method lives in its own Tesseract, a container with a typed `apply` interface plus a
+`vector_jacobian_product` where gradients are needed. They share that interface, so
+swapping a JAX component for a PyTorch one, or a point estimate for a posterior,
+changes a name in the calling code and leaves the rest alone.
+
+## Three ways to invert
+
+1. **Solver-adjoint.** Run a differentiable spectral Burgers solver, compare its output
+   to the data, and let `jax.grad` move ν downhill through the solver's VJP, which is
+   the PDE adjoint. Accurate and cheap per step. It needs the solver in the loop.
+2. **PINN.** Train a neural network to satisfy the PDE and fit the data at once, then
+   read ν off the trained model. No solver at inference. The same network ships as
+   `pinn_jax` and `pinn_pytorch` behind one contract, so changing framework is a swap,
+   not a rewrite.
+3. **Amortized posterior (FMPE).** Trade the point estimate for a distribution. A
+   flow-matching network, trained offline on simulations, reads one observation and
+   returns a posterior over `(nu, ic_amp, ic_phase)` in a single forward pass.
+
+## Quickstart
+
+```bash
+git clone https://github.com/julian-8897/tesseract-pinn-inverse-burgers.git
+cd tesseract-pinn-inverse-burgers
+uv sync
+./buildall.sh    # build the solver and PINN Tesseract images (needs Docker)
+```
+
+Open the interactive demo:
+
+```bash
+uv run streamlit run app.py
+```
+
+Or compare the two deterministic methods from the command line:
+
+```bash
+uv run python inverse_problem.py --mode compare --epochs 100 --seed 123
+```
+
+The posterior method needs one extra step, `make train-posterior`, covered in
+[Uncertainty quantification](#uncertainty-quantification-amortized-flow-matching-posterior).
 
 ---
 
 ## Contents
 
-- [Problem Statement](#problem-statement)
+- [What this is](#what-this-is)
+- [Three ways to invert](#three-ways-to-invert)
+- [Quickstart](#quickstart)
+- [Problem statement](#problem-statement)
 - [Implementation](#implementation)
 - [Configuration](#configuration)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Results](#results)
-- [Current Status](#current-status)
-- [Limitations and Roadmap](#limitations-and-roadmap)
+- [Current status](#current-status)
+- [Limitations and roadmap](#limitations-and-roadmap)
 - [References](#references)
 
 ---
 
-## Problem Statement
+## Problem statement
 
-Given noisy observations of the 1D Burgers equation solution, infer the unknown viscosity parameter $\nu$:
+The same idea, stated precisely. Given noisy observations of the 1D Burgers solution, infer the viscosity $\nu$ in
 
 $$
 \frac{\partial u}{\partial t} + u \frac{\partial u}{\partial x} = \nu \frac{\partial^2 u}{\partial x^2}
@@ -300,28 +338,25 @@ When `--out` is set, the CLI writes artifacts under
 uv run streamlit run app.py
 ```
 
-The app exposes all three swappable Tesseracts behind one sidebar **method**
-selector — each method makes a *different* Tesseract the active boundary of the
-same inverse problem:
+The app puts all three components behind one sidebar **method** selector. Each method
+makes a different Tesseract the active boundary of the same problem:
 
-- **Solver-adjoint inversion** — optimize `log_nu` by differentiating the data-fit
-  loss through the `burgers_solver` Tesseract VJP (the PDE-constrained baseline);
-  live convergence plus the recovered solver field vs. ground truth. *Requires the
-  `burgers_solver` image.*
-- **PINN inversion (JAX ↔ PyTorch)** — the cross-framework showcase: adjustable
-  hyperparameters/sampling/loss weights, viscosity warmup and clipping, optional
-  BRDR adaptive weighting with mean-weight plots, a Tesseract trace panel with
-  measured apply/VJP call counts, PINN-vs-solver field plots, and a JAX/PyTorch
-  backend consistency report. *Requires the `pinn_jax` / `pinn_pytorch` images.*
-- **FMPE posterior (UQ)** — pick a ground-truth `(nu, ic_amp, ic_phase)`; the solver
-  builds a noisy observation at the trained sensor layout and the apply-only
-  `fmpe_posterior` Tesseract returns a full posterior in one forward pass, rendered
-  as marginals, a corner plot, a coverage summary, and the calibration caveat. *Runs
-  fully in-process — no Docker image required, only the trained `posterior.pkl`.*
+- **Solver-adjoint.** Optimize `log_nu` through the `burgers_solver` VJP, with live
+  convergence and the recovered solver field against ground truth. Needs the
+  `burgers_solver` image.
+- **PINN (JAX or PyTorch).** The cross-framework path: hyperparameters, sampling, loss
+  weights, viscosity warmup and clipping, optional BRDR weighting, a trace panel with
+  measured apply/VJP counts, field plots, and a JAX-vs-PyTorch consistency report.
+  Needs the `pinn_jax` and `pinn_pytorch` images.
+- **Posterior (FMPE).** Pick a ground-truth `(nu, ic_amp, ic_phase)`; the solver builds
+  a noisy observation and the apply-only `fmpe_posterior` component returns a posterior
+  in one pass, shown as marginals, a corner plot, a coverage table, and the calibration
+  caveat. Runs in-process, with no Docker image needed beyond the trained
+  `posterior.pkl`.
 
-The CLI is the reference path for dataclass configs and seeded runs; the app and
-CLI share the same callback-driven training engines (`train_inverse`,
-`train_solver_inverse`) and the same packaged `fmpe_posterior` component.
+The CLI and the app call the same training engines (`train_inverse`,
+`train_solver_inverse`) and the same `fmpe_posterior` component, so a run reproduces
+either way.
 
 ### Uncertainty quantification (amortized flow-matching posterior)
 
@@ -497,7 +532,7 @@ Vector versions: [backend comparison](img/pinn_solution_comparison.pdf),
 ## Current Status
 
 - Two differentiable inverse methods: **solver-adjoint** (`--mode solver-inverse`, `jax.grad` through the solver VJP) and **PINN** (`--mode pinn`, `jax.grad` through the PINN VJP); `--mode compare` tabulates both.
-- For scalar viscosity inversion the solver-adjoint method is dramatically more accurate and cheaper per step than the PINN; the PINN is mesh-free and needs no solver but converges more slowly. The two PINN backends (JAX, PyTorch) agree, demonstrating backend-agnostic consistency.
+- For scalar viscosity inversion the solver-adjoint method is much more accurate and cheaper per step than the PINN. The PINN needs no solver at inference but converges slower. The JAX and PyTorch PINN backends agree, which is the backend-agnostic consistency check.
 - Each step uses one `jax.value_and_grad`; complete-epoch Tesseract apply/VJP counts are measured through the `tesseract_jax` dispatch layer.
 - Loss weights can be fixed or adapted with opt-in BRDR pointwise residual weighting; the CLI and Streamlit app share callback-driven training engines.
 - Stage B SBI is implemented: FMPE jointly infers `(nu, ic_amp, ic_phase)`, supports deterministic training, emits a validated versioned model bundle, and has tracked SBC/TARP and contraction tooling.
@@ -508,7 +543,7 @@ Vector versions: [backend comparison](img/pinn_solution_comparison.pdf),
 - **FMPE calibration caveat:** Stage B posterior inference is implemented, but the `nu` marginal is mildly overconfident in reference SBC diagnostics. Joint TARP coverage and the IC marginals are stronger.
 - **Point-estimate scope:** deterministic inversion still optimizes only viscosity `nu`; the FMPE posterior already treats `ic_amp` and `ic_phase` as nuisance parameters and infers all three jointly.
 - **Optional Stage C:** solver-gradient refinement of FMPE samples through the solver VJP has not been implemented.
-- **Model-misspecification sidebar (experimental):** a KdV-Burgers truth oracle (`solve_kdv_burgers`) plus a learned-discrepancy hybrid (`train_hybrid_inverse`) are included to *demonstrate* a known failure mode — naive calibration-with-discrepancy is confounded with the calibration parameter and biases it (Brynjarsdóttir & O'Hagan, 2014). This is documented as a limitation, not a headline result, and motivates the posterior treatment above.
+- **Model-misspecification sidebar (experimental):** a KdV-Burgers truth oracle (`solve_kdv_burgers`) plus a learned-discrepancy hybrid (`train_hybrid_inverse`) are included to *demonstrate* a known failure mode: naive calibration-with-discrepancy is confounded with the calibration parameter and biases it (Brynjarsdóttir & O'Hagan, 2014). This is documented as a limitation, not a headline result, and motivates the posterior treatment above.
 - **No checkpointing; PINN model reconstructed from `params_flat` per call.**
 
 ## References
