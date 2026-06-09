@@ -12,11 +12,21 @@ ways, with each method packaged as a swappable
 [Tesseract](https://github.com/pasteurlabs/tesseract-core) component.
 
 <p align="center">
-  <img src="img/sbi/fmpe_posterior.png" width="640"
-       alt="Posterior over the Burgers viscosity and the two initial-condition parameters">
+  <img src="img/burgers_evolution.gif" width="720"
+       alt="Burgers field evolving in time at low and high viscosity">
   <br>
-  <em>The headline result: an amortized posterior over the viscosity and the initial
-  wave, inferred from a single sparse observation. Dashed lines mark the truth.</em>
+  <em>The forward problem. A sine wave steepens into a front and then smears. Low
+  viscosity (left) keeps a sharp shock; high viscosity (right) rounds it off. The
+  inverse problem is to read that viscosity back from sparse samples of this field.</em>
+</p>
+
+<p align="center">
+  <img src="img/posterior_tracking.gif" width="640"
+       alt="FMPE posterior over the viscosity tracking a moving ground truth">
+  <br>
+  <em>The headline method. One amortized FMPE posterior, queried as the true viscosity
+  sweeps across the prior. Every frame is a fresh observation and a fresh posterior,
+  each from the same trained network in a single forward pass.</em>
 </p>
 
 ## What this is
