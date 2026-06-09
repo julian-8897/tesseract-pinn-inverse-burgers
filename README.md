@@ -13,20 +13,23 @@ ways, with each method packaged as a swappable
 
 <p align="center">
   <img src="img/burgers_evolution.gif" width="720"
-       alt="Burgers field evolving in time at low and high viscosity">
+       alt="Space-time Burgers field building up in time at low and high viscosity">
   <br>
-  <em>The forward problem. A sine wave steepens into a front and then smears. Low
-  viscosity (left) keeps a sharp shock; high viscosity (right) rounds it off. The
-  inverse problem is to read that viscosity back from sparse samples of this field.</em>
+  <em><b>The forward problem, as a space-time diagram.</b> Time runs upward and the
+  field u(x, t) fills in as the solver integrates. At low viscosity (left) the wave
+  steepens into a sharp shock, the near-vertical red/blue interface near x = 0.5; at
+  high viscosity (right) the same wave diffuses and fades. The inverse problem is to
+  read that viscosity back from sparse samples of this field.</em>
 </p>
 
 <p align="center">
   <img src="img/posterior_tracking.gif" width="640"
        alt="FMPE posterior over the viscosity tracking a moving ground truth">
   <br>
-  <em>The headline method. One amortized FMPE posterior, queried as the true viscosity
-  sweeps across the prior. Every frame is a fresh observation and a fresh posterior,
-  each from the same trained network in a single forward pass.</em>
+  <em><b>The headline method.</b> One amortized FMPE posterior over ν, queried as the
+  true value (dashed) sweeps across the prior. Each frame is a new observation and a
+  new posterior from the same trained network, in a single forward pass. The median
+  sits a little right of the truth, the mild overconfidence noted under Limitations.</em>
 </p>
 
 ## What this is
