@@ -30,4 +30,4 @@ jobs:
         run: uv run --with ruff ruff format --check .
 
       - name: Test
-        run: uv run --with pytest python -m pytest tests -q
+        run: uv run --with pytest python -m pytest tests -q -m "not slow"

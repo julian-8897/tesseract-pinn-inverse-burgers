@@ -1,0 +1,4 @@
+numpy
+torch>=2.9.1
+sbi==0.26.1
+zuko==1.6.0

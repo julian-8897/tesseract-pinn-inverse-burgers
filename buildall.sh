@@ -1,39 +1,34 @@
-#!/bin/bash
-# Build all tesseracts in the project
-# Assumes tesseract CLI is installed
+#!/usr/bin/env bash
+# Build every locally configured Tesseract image.
 
-set -e  # Exit on error
+set -euo pipefail
 
-echo "========================================="
-echo "Building Tesseracts"
-echo "========================================="
-echo ""
+printf '%s\n' "Building Tesseracts" "==================="
 
-# Check if tesseract CLI is available
-if ! command -v tesseract &> /dev/null; then
-    echo "Error: tesseract CLI not found. Please install tesseract-core first."
-    echo "Visit: https://github.com/pasteurlabs/tesseract-core"
+if ! command -v tesseract >/dev/null 2>&1; then
+    printf '%s\n' \
+        "Error: tesseract CLI not found. Install tesseract-core first." \
+        "https://github.com/pasteurlabs/tesseract-core"
     exit 1
 fi
 
-# Check if tesseract CLI is the correct one
-# To avoid potential conflicts with other tools named Tesseract
 if ! tesseract --help | grep -q "autodiff"; then
-    echo "Error: wrong tesseract CLI. Please install tesseract-core first."
-    echo "Visit: https://github.com/pasteurlabs/tesseract-core"
+    printf '%s\n' \
+        "Error: the installed tesseract command is not tesseract-core." \
+        "https://github.com/pasteurlabs/tesseract-core"
     exit 1
 fi
 
+for tess_dir in tesseracts/*/; do
+    if [ "${tess_dir}" = "tesseracts/fmpe_posterior/" ] && [ ! -f "${tess_dir}posterior.pkl" ]; then
+        printf 'Skipping %s: posterior.pkl is missing.\n' "${tess_dir}"
+        printf '%s\n\n' "Train it first with: make train-posterior"
+        continue
+    fi
 
-for tess_dir in tesseracts/*/
-do
-    echo "Building ${tess_dir}"
-    tesseract build ${tess_dir}
-    echo "✓ ${tess_dir} built successfully"
-    echo ""
+    printf 'Building %s\n' "${tess_dir}"
+    tesseract build "${tess_dir}"
+    printf 'Built %s\n\n' "${tess_dir}"
 done
 
-
-echo "========================================="
-echo "✓ All tesseracts built successfully!"
-echo "========================================="
+printf '%s\n' "All available Tesseracts built successfully."

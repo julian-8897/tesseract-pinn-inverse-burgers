@@ -13,13 +13,17 @@ import csv
 import json
 import sys
 import time
-from contextlib import contextmanager
+from abc import ABC, abstractmethod
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from statistics import fmean, pstdev
+from typing import NamedTuple
 
+import diffrax
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import torch
 from rich.console import Console
@@ -34,8 +38,10 @@ from rich.table import Table
 from tesseract_core import Tesseract
 from tesseract_jax import apply_tesseract
 
+from component_loader import load_tesseract_api
 from configs import (
     DEFAULT_LOSS_WEIGHTS,
+    DEFAULT_NOISE_STD,
     LOSS_WEIGHT_NAMES,
     LossWeights,
     RunConfig,
@@ -43,8 +49,16 @@ from configs import (
     normalize_loss_weights,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent
 CONSOLE = Console()
+
+# Solver discretization grid. Shared by the forward solver, the observation
+# samplers, and the FMPE sensor layout — named generically rather than after any
+# one experiment so cross-module imports read honestly.
+SOLVER_NX = 128
+SOLVER_NT = 64
+# Smallest observation/collocation time. Sensors and collocation points avoid
+# t≈0, where the initial condition dominates and the inverse signal is weak.
+MIN_OBS_TIME = 0.05
 
 
 def format_loss_weights(loss_weights):
@@ -335,60 +349,77 @@ def log_seed_summary(results):
 
 
 def get_burgers_solver():
-    """Import the solver without leaving a conflicting tesseract_api module loaded."""
-    solver_path = str(REPO_ROOT / "tesseracts" / "burgers_solver")
-    previous_module = sys.modules.pop("tesseract_api", None)
+    """Load the in-process Burgers solver implementation."""
+    return load_tesseract_api("burgers_solver").solve_burgers
 
-    sys.path.insert(0, solver_path)
-    try:
-        from tesseract_api import solve_burgers
-    finally:
-        sys.path.pop(0)
-        if "tesseract_api" in sys.modules:
-            del sys.modules["tesseract_api"]
-        if previous_module is not None:
-            sys.modules["tesseract_api"] = previous_module
 
-    return solve_burgers
+def evaluate_pinn_solution_grid(
+    true_viscosity,
+    params_flat,
+    pinn,
+    nx=128,
+    nt=64,
+    *,
+    ic_amp=1.0,
+    ic_phase=0.0,
+):
+    """Evaluate a PINN and the Burgers solver on one visualization grid."""
+    x = np.linspace(0.0, 1.0, nx, endpoint=False, dtype=np.float32)
+    t = np.linspace(0.0, 1.0, nt, dtype=np.float32)
+    x_grid, t_grid = np.meshgrid(x, t)
+
+    result = apply_tesseract(
+        pinn,
+        {
+            "x": jnp.asarray(x_grid.ravel(), dtype=jnp.float32),
+            "t": jnp.asarray(t_grid.ravel(), dtype=jnp.float32),
+            "params_flat": params_flat,
+        },
+    )
+    u_pred = np.asarray(result["u_pred"]).reshape(nt, nx)
+
+    solve_burgers = get_burgers_solver()
+    u_solver = solve_burgers(
+        jnp.asarray(true_viscosity, dtype=jnp.float32),
+        jnp.asarray(x, dtype=jnp.float32),
+        jnp.asarray(t, dtype=jnp.float32),
+        jnp.asarray(ic_amp, dtype=jnp.float32),
+        jnp.asarray(ic_phase, dtype=jnp.float32),
+    )
+    return x_grid, t_grid, u_pred, np.asarray(u_solver)
 
 
 def get_initial_params(backend="jax", seed=42):
     """Get initial parameters for the specified backend."""
-    backend_path = REPO_ROOT / "tesseracts" / f"pinn_{backend}"
-    previous_module = sys.modules.pop("tesseract_api", None)
-    sys.path.insert(0, str(backend_path))
+    api = load_tesseract_api(f"pinn_{backend}")
 
     if backend == "jax":
         key = jax.random.PRNGKey(seed)
     else:  # pytorch
         torch.manual_seed(seed)
 
-    try:
-        from tesseract_api import PINNNet, flatten_params
-
-        if backend == "jax":
-            model = PINNNet(key)
-        else:
-            # For PyTorch, initialize from actual model for proper initialization.
-            model = PINNNet(hidden_sizes=[64, 64, 64], n_fourier_features=32, seed=seed)
-        return jnp.array(flatten_params(model))
-    finally:
-        sys.path.pop(0)
-        if "tesseract_api" in sys.modules:
-            del sys.modules["tesseract_api"]
-        if previous_module is not None:
-            sys.modules["tesseract_api"] = previous_module
+    if backend == "jax":
+        model = api.PINNNet(key)
+    else:
+        model = api.PINNNet(
+            hidden_sizes=[64, 64, 64],
+            n_fourier_features=32,
+            seed=seed,
+        )
+    return jnp.array(api.flatten_params(model))
 
 
-def generate_observations(n_points, true_viscosity, domain, key, noise_std=0.02):
+def generate_observations(
+    n_points, true_viscosity, domain, key, noise_std=DEFAULT_NOISE_STD
+):
     """
     Generate synthetic observations from the pseudospectral Burgers solver.
 
     The solver uses the same sinusoidal initial condition assumed by the PINN
     initial-condition loss: u(x, 0) = sin(2πx).
     """
-    nx = 128
-    nt = 64
+    nx = SOLVER_NX
+    nt = SOLVER_NT
     keys = jax.random.split(key, 3)
 
     x_grid = jnp.linspace(
@@ -406,7 +437,7 @@ def generate_observations(n_points, true_viscosity, domain, key, noise_std=0.02)
     )
 
     x_idx = jax.random.randint(keys[0], (n_points,), minval=0, maxval=nx)
-    min_t_idx = max(1, int(jnp.searchsorted(t_grid, 0.05, side="left")))
+    min_t_idx = max(1, int(jnp.searchsorted(t_grid, MIN_OBS_TIME, side="left")))
     t_idx = jax.random.randint(keys[1], (n_points,), minval=min_t_idx, maxval=nt)
 
     x = x_grid[x_idx]
@@ -418,6 +449,176 @@ def generate_observations(n_points, true_viscosity, domain, key, noise_std=0.02)
     u_observed = u_observed + noise
 
     return x, t, u_observed
+
+
+#
+# Hybrid Stage 1: KdV-Burgers truth oracle + discrepancy calibration
+#
+# The in-loop simulator (the `burgers_solver` Tesseract) solves plain viscous
+# Burgers. The *truth* is generated here from the structurally richer KdV-Burgers
+# equation `u_t + u u_x = nu u_xx - beta u_xxx`. The dispersive `-beta u_xxx` term
+# is outside the simulator's reachable family for any `nu`, so the discrepancy the
+# PINN learns is irreducible (there is genuinely something to correct). This oracle
+# is a local JAX function, not a Tesseract, because it is never differentiated.
+#
+
+_KDV_DT0 = 1e-3
+_KDV_RTOL = 1e-6
+_KDV_ATOL = 1e-6
+_KDV_MAX_STEPS = 200_000
+
+
+def _kdv_burgers_rhs(u, nu, beta, x_grid):
+    """Spectral RHS for KdV-Burgers: -u u_x + nu u_xx - beta u_xxx (dealiased)."""
+    nx = u.shape[0]
+    dx = x_grid[1] - x_grid[0]
+    k = 2.0 * jnp.pi * jnp.fft.fftfreq(nx) / dx
+    u_hat = jnp.fft.fft(u)
+    u_x = jnp.fft.ifft(1j * k * u_hat).real
+    u_xx = jnp.fft.ifft(-(k**2) * u_hat).real
+    u_xxx = jnp.fft.ifft(-1j * (k**3) * u_hat).real  # (i k)^3 = -i k^3
+
+    # 2/3-rule dealiasing of the nonlinear product, matching the solver Tesseract.
+    mode_numbers = jnp.fft.fftfreq(nx) * nx
+    keep = jnp.abs(mode_numbers) <= (nx // 3)
+    nonlinear = jnp.fft.ifft(jnp.fft.fft(u * u_x) * keep).real
+
+    return -nonlinear + nu * u_xx - beta * u_xxx
+
+
+def solve_kdv_burgers(nu, beta, x_grid, t_grid, ic_amp=1.0, ic_phase=0.0):
+    """High-fidelity KdV-Burgers truth oracle.
+
+    Solves `u_t + u u_x = nu u_xx - beta u_xxx` spectrally with the same periodic
+    sinusoidal IC and dealiasing as the in-loop `burgers_solver` Tesseract, plus the
+    extra dispersive term the simulator omits. With ``beta == 0`` it reproduces the
+    plain viscous-Burgers field (discrepancy collapses to zero).
+    """
+    nu = jnp.asarray(nu, dtype=jnp.float32)
+    beta = jnp.asarray(beta, dtype=jnp.float32)
+    x_grid = jnp.asarray(x_grid, dtype=jnp.float32)
+    t_grid = jnp.asarray(t_grid, dtype=jnp.float32)
+    u0 = jnp.asarray(ic_amp, dtype=jnp.float32) * jnp.sin(
+        2.0 * jnp.pi * x_grid + jnp.asarray(ic_phase, dtype=jnp.float32)
+    )
+
+    def vector_field(_, u, args):
+        nu_value, beta_value, grid = args
+        return _kdv_burgers_rhs(u, nu_value, beta_value, grid)
+
+    sol = diffrax.diffeqsolve(
+        diffrax.ODETerm(vector_field),
+        diffrax.Tsit5(),
+        t0=t_grid[0],
+        t1=t_grid[-1],
+        dt0=_KDV_DT0,
+        y0=u0,
+        args=(nu, beta, x_grid),
+        saveat=diffrax.SaveAt(ts=t_grid),
+        stepsize_controller=diffrax.PIDController(rtol=_KDV_RTOL, atol=_KDV_ATOL),
+        max_steps=_KDV_MAX_STEPS,
+    )
+    return sol.ys
+
+
+class GridObservations(NamedTuple):
+    """Sparse observations plus the grid/indices the in-loop solver field is
+    gathered at. Shared by ``--mode solver-inverse`` (clean Burgers truth) and the
+    experimental KdV discrepancy sidebar."""
+
+    x_obs: jax.Array
+    t_obs: jax.Array
+    u_obs: jax.Array
+    x_grid: jax.Array
+    t_grid: jax.Array
+    x_idx: jax.Array
+    t_idx: jax.Array
+
+
+def _sample_grid_indices(key, n_points, x_grid, t_grid):
+    """Sample sparse grid-node indices, with a small time floor (t >= 0.05)."""
+    keys = jax.random.split(key, 2)
+    nx, nt = x_grid.shape[0], t_grid.shape[0]
+    x_idx = jax.random.randint(keys[0], (n_points,), minval=0, maxval=nx)
+    min_t_idx = max(1, int(jnp.searchsorted(t_grid, MIN_OBS_TIME, side="left")))
+    t_idx = jax.random.randint(keys[1], (n_points,), minval=min_t_idx, maxval=nt)
+    return x_idx, t_idx
+
+
+def generate_grid_observations(
+    n_points, true_viscosity, domain, key, noise_std=DEFAULT_NOISE_STD
+):
+    """Sparse noisy observations from the in-loop viscous-Burgers solver itself.
+
+    The truth here is the *same* physics the ``solver-inverse`` mode optimizes
+    against (plain viscous Burgers), so the inverse problem is well-posed and the
+    solver-adjoint estimate recovers ``nu`` up to noise. Returns the grid and the
+    sampled `(t_idx, x_idx)` so the in-loop solver field can be gathered at the same
+    nodes inside the differentiated objective.
+    """
+    nx, nt = SOLVER_NX, SOLVER_NT
+    key_idx, key_noise = jax.random.split(key, 2)
+
+    x_grid = jnp.linspace(
+        domain["x"][0], domain["x"][1], nx, endpoint=False, dtype=jnp.float32
+    )
+    t_grid = jnp.linspace(domain["t"][0], domain["t"][1], nt, dtype=jnp.float32)
+
+    solve_burgers = get_burgers_solver()
+    u_field = solve_burgers(
+        jnp.asarray(true_viscosity, dtype=jnp.float32),
+        x_grid,
+        t_grid,
+        jnp.array(1.0, dtype=jnp.float32),
+        jnp.array(0.0, dtype=jnp.float32),
+    )
+
+    x_idx, t_idx = _sample_grid_indices(key_idx, n_points, x_grid, t_grid)
+    noise = jax.random.normal(key_noise, (n_points,)) * noise_std
+
+    return GridObservations(
+        x_obs=x_grid[x_idx],
+        t_obs=t_grid[t_idx],
+        u_obs=u_field[t_idx, x_idx] + noise,
+        x_grid=x_grid,
+        t_grid=t_grid,
+        x_idx=x_idx,
+        t_idx=t_idx,
+    )
+
+
+def generate_kdv_observations(
+    n_points, true_viscosity, dispersion_beta, domain, key, noise_std=DEFAULT_NOISE_STD
+):
+    """Sample sparse noisy observations from the KdV-Burgers truth at grid nodes.
+
+    Mirrors :func:`generate_observations`' grid, RNG split, time floor, and noise
+    model so the hybrid mode's data is directly comparable to the other modes, but
+    also returns the grid and the sampled `(t_idx, x_idx)` so the in-loop solver
+    field can be gathered at the same nodes inside the differentiated objective.
+    """
+    nx, nt = SOLVER_NX, SOLVER_NT
+    key_idx, key_noise = jax.random.split(key, 2)
+
+    x_grid = jnp.linspace(
+        domain["x"][0], domain["x"][1], nx, endpoint=False, dtype=jnp.float32
+    )
+    t_grid = jnp.linspace(domain["t"][0], domain["t"][1], nt, dtype=jnp.float32)
+
+    u_field = solve_kdv_burgers(true_viscosity, dispersion_beta, x_grid, t_grid)
+
+    x_idx, t_idx = _sample_grid_indices(key_idx, n_points, x_grid, t_grid)
+    noise = jax.random.normal(key_noise, (n_points,)) * noise_std
+
+    return GridObservations(
+        x_obs=x_grid[x_idx],
+        t_obs=t_grid[t_idx],
+        u_obs=u_field[t_idx, x_idx] + noise,
+        x_grid=x_grid,
+        t_grid=t_grid,
+        x_idx=x_idx,
+        t_idx=t_idx,
+    )
 
 
 def compute_pointwise_losses(
@@ -630,9 +831,11 @@ def compute_loss_from_log_viscosity(
 #
 # Shared training engine
 #
-# A single `train_inverse` loop powers both the CLI (`inverse_problem.py`) and
-# the Streamlit app (`app.py`). Presentation lives in callbacks so neither
-# frontend reimplements the optimization.
+# Every inverse mode runs on one optimization loop (`_run_inverse_training`,
+# defined below) parameterized by an `InverseStrategy`. Presentation lives in
+# callbacks so neither the CLI (`inverse_problem.py`) nor the Streamlit app
+# (`app.py`) reimplements the optimization. The call-counter, callback contract,
+# and `EpochRecord` that the engine depends on are defined first.
 #
 
 
@@ -778,13 +981,13 @@ def build_training_inputs(config):
         key_col_x, (training.n_col,), minval=domain["x"][0], maxval=domain["x"][1]
     )
     t_col = jax.random.uniform(
-        key_col_t, (training.n_col,), minval=0.05, maxval=domain["t"][1]
+        key_col_t, (training.n_col,), minval=MIN_OBS_TIME, maxval=domain["t"][1]
     )
     x_ic = jax.random.uniform(
         key_ic, (training.n_ic,), minval=domain["x"][0], maxval=domain["x"][1]
     )
     t_bc = jax.random.uniform(
-        key_bc, (training.n_bc,), minval=0.05, maxval=domain["t"][1]
+        key_bc, (training.n_bc,), minval=MIN_OBS_TIME, maxval=domain["t"][1]
     )
     return x_obs, t_obs, u_obs, x_col, t_col, x_ic, t_bc
 
@@ -820,41 +1023,243 @@ def _loss_from_log_and_params(
     )
 
 
-def train_inverse(config, *, pinn=None, callback=None, metrics_every=20):
-    """Run the inverse-viscosity optimization loop.
+# ---------------------------------------------------------------------------
+# Shared inverse-training engine (Strategy + Factory)
+#
+# All three inverse modes — PINN inversion, solver-adjoint inversion, and the
+# hybrid discrepancy calibration — share one epoch loop: optimize ``log_nu``
+# with optax against a mode-specific differentiable objective, gate it behind a
+# warm-up, time each step, count Tesseract dispatches, accumulate history, and
+# emit ``EpochRecord``s to a callback. The invariant loop lives in
+# ``_run_inverse_training``; each mode supplies an ``InverseStrategy`` owning
+# what differs — the data + Tesseract component(s), the value-and-grad objective
+# and any auxiliary trainable parameters, the per-epoch telemetry, and the
+# mode-specific result keys. ``make_inverse_strategy`` is the factory that picks
+# one by mode.
+# ---------------------------------------------------------------------------
 
-    A single reverse-mode `value_and_grad` over both ``log_nu`` and the PINN
-    parameters replaces the previous two separate `jax.grad` passes plus a
-    standalone loss evaluation, cutting Tesseract round-trips per step from three
-    forward/backward sweeps to one. Presentation is delegated to ``callback``.
 
-    Args:
-        config: a validated ``RunConfig``.
-        pinn: an already-open Tesseract. If ``None``, one is created from the
-            backend image and managed for the duration of the call.
-        callback: optional ``TrainingCallback`` for progress/visualization.
-        metrics_every: cadence (in epochs) for computing full loss components.
+@dataclass
+class StepResult:
+    """Mode-specific values from one optimization step.
+
+    The engine consumes ``log_v_grad`` to advance ``log_nu`` and combines the
+    remaining values with complete-epoch Tesseract call telemetry.
     """
-    backend = config.backend
+
+    loss: float
+    log_v_grad: object
+    param_grad_norm: float
+    effective_weights: dict
+    param_count: int
+    brdr_weights: object | None = None
+    aux: object = None
+
+
+class InverseStrategy(ABC):
+    """Mode-specific behavior plugged into :func:`_run_inverse_training`.
+
+    The engine owns the invariant ``log_nu`` optimization (optax + warm-up +
+    clipping), timing, history buffers, and callback dispatch. A concrete
+    strategy owns everything that varies between modes: the observations and the
+    Tesseract component(s), the differentiable objective and any auxiliary
+    trainable parameters, the per-epoch loss components, and the mode-specific
+    keys glued onto the final result dict.
+    """
+
+    #: Loss-component names this mode reports; drives the history buffers.
+    loss_component_names: tuple[str, ...] = ("total",)
+
+    @abstractmethod
+    def open_components(self, stack: ExitStack) -> None:
+        """Enter any *owned* Tesseract context managers on ``stack``."""
+
+    @abstractmethod
+    def start_context(self, warmup_epochs: int) -> dict:
+        """Build the context dict handed to ``callback.on_start``."""
+
+    @abstractmethod
+    def run_step(self, log_viscosity, epoch: int) -> StepResult:
+        """Run one backward pass, update auxiliary params, and return step values."""
+
+    @abstractmethod
+    def epoch_loss_components(self, viscosity, log_viscosity, step, record):
+        """Loss components for this epoch's ``EpochRecord`` (``None`` to omit)."""
+
+    @abstractmethod
+    def finalize_result(self, base: dict) -> dict:
+        """Augment the engine's common ``base`` result with mode-specific keys."""
+
+
+class PINNStrategy(InverseStrategy):
+    """PINN inversion: jointly optimize ``log_nu`` and the PINN parameters,
+    differentiating one composed loss through the PINN Tesseract VJP."""
+
+    loss_component_names = ("total", "data", "physics", "ic", "bc")
+
+    def __init__(self, config, *, pinn=None):
+        self.config = config
+        self.backend = config.backend
+        self.training = config.training
+        self.data_config = config.data
+        self.loss_weights = config.loss.as_dict()
+        if self.training.adaptive_loss_weights:
+            validate_brdr_loss_weights(self.loss_weights)
+
+        self.inputs = build_training_inputs(config)
+        self.image_name = image_name_for_backend(self.backend)
+        self.owns_pinn = pinn is None
+        self.pinn = pinn if pinn is not None else Tesseract.from_image(self.image_name)
+
+        self.params_flat = get_initial_params(self.backend, seed=self.data_config.seed)
+        self.param_optimizer = optax.adam(self.training.param_learning_rate)
+        self.param_opt_state = self.param_optimizer.init(self.params_flat)
+        self.loss_and_grads = jax.value_and_grad(
+            _loss_from_log_and_params, argnums=(0, 1)
+        )
+        self.brdr_state = None
+        self.loss_weight_history = {
+            name: [self.loss_weights[name]] for name in LOSS_WEIGHT_NAMES
+        }
+
+    def open_components(self, stack):
+        if self.owns_pinn:
+            stack.enter_context(self.pinn)
+
+    def start_context(self, warmup_epochs):
+        x_obs, t_obs, u_obs = self.inputs[:3]
+        return {
+            "config": self.config,
+            "backend": self.backend,
+            "image_name": self.image_name,
+            "warmup_epochs": warmup_epochs,
+            "x_obs": x_obs,
+            "t_obs": t_obs,
+            "u_obs": u_obs,
+        }
+
+    def run_step(self, log_viscosity, epoch):
+        x_obs, t_obs, u_obs, x_col, t_col, x_ic, t_bc = self.inputs
+        training = self.training
+        viscosity = jnp.exp(log_viscosity)
+
+        brdr_weights = None
+        if training.adaptive_loss_weights:
+            pointwise_losses = compute_pointwise_losses(
+                viscosity,
+                self.params_flat,
+                x_obs,
+                t_obs,
+                u_obs,
+                x_col,
+                t_col,
+                x_ic,
+                t_bc,
+                self.pinn,
+            )
+            if self.brdr_state is None:
+                self.brdr_state = initialize_brdr_state(pointwise_losses)
+            self.brdr_state = update_brdr_state(
+                self.brdr_state,
+                pointwise_losses,
+                beta_c=training.brdr_beta_c,
+                beta_w=training.brdr_beta_w,
+                eps=training.brdr_epsilon,
+            )
+            brdr_weights = self.brdr_state["weights"]
+
+        # One reverse-mode sweep yields the loss and both gradients.
+        loss, (log_v_grad, p_grad) = self.loss_and_grads(
+            log_viscosity,
+            self.params_flat,
+            x_obs,
+            t_obs,
+            u_obs,
+            x_col,
+            t_col,
+            x_ic,
+            t_bc,
+            self.pinn,
+            brdr_weights,
+            self.loss_weights,
+        )
+
+        param_updates, self.param_opt_state = self.param_optimizer.update(
+            p_grad, self.param_opt_state
+        )
+        self.params_flat = optax.apply_updates(self.params_flat, param_updates)
+
+        effective_weights = (
+            dict(self.loss_weights)
+            if brdr_weights is None
+            else summarize_brdr_weights(brdr_weights)
+        )
+        for name in LOSS_WEIGHT_NAMES:
+            self.loss_weight_history[name].append(effective_weights[name])
+
+        return StepResult(
+            loss=float(loss),
+            log_v_grad=log_v_grad,
+            param_grad_norm=float(jnp.linalg.norm(p_grad)),
+            effective_weights=effective_weights,
+            param_count=int(self.params_flat.size),
+            brdr_weights=brdr_weights,
+        )
+
+    def epoch_loss_components(self, viscosity, log_viscosity, step, record):
+        if not record:
+            return None
+        x_obs, t_obs, u_obs, x_col, t_col, x_ic, t_bc = self.inputs
+        return {
+            name: float(value)
+            for name, value in compute_loss_components(
+                viscosity,
+                self.params_flat,
+                x_obs,
+                t_obs,
+                u_obs,
+                x_col,
+                t_col,
+                x_ic,
+                t_bc,
+                self.pinn,
+                brdr_weights=step.brdr_weights,
+                loss_weights=self.loss_weights,
+            ).items()
+        }
+
+    def finalize_result(self, base):
+        warmup_epochs = min(
+            self.training.viscosity_warmup_epochs, max(0, self.training.n_epochs - 1)
+        )
+        return {
+            "backend": self.backend,
+            "tesseract_image": self.image_name,
+            **base,
+            "loss_weights": self.loss_weights,
+            "loss_weight_history": self.loss_weight_history,
+            "brdr_state": self.brdr_state,
+            "adaptive_loss_weights": self.training.adaptive_loss_weights,
+            "params_flat": self.params_flat,
+            "warmup_epochs": warmup_epochs,
+            "observations": tuple(self.inputs[:3]),
+            "pinn": self.pinn,
+        }
+
+
+def _run_inverse_training(config, strategy, *, callback=None, metrics_every=20):
+    """Drive the invariant inverse-training loop for any :class:`InverseStrategy`.
+
+    Optimizes ``log_nu`` against the strategy's objective: each epoch runs the
+    strategy's step, applies the (warm-up-gated, optionally clipped) ``log_nu``
+    update, records history, and emits an ``EpochRecord``. The strategy supplies
+    the objective, telemetry, and the mode-specific result keys.
+    """
     problem = config.problem
     data_config = config.data
     training = config.training
-    loss_weights = config.loss.as_dict()
-
-    if training.adaptive_loss_weights:
-        validate_brdr_loss_weights(loss_weights)
-
     callback = callback or TrainingCallback()
     counter = TesseractCallCounter()
-
-    x_obs, t_obs, u_obs, x_col, t_col, x_ic, t_bc = build_training_inputs(config)
-
-    image_name = image_name_for_backend(backend)
-    owns_pinn = pinn is None
-    if owns_pinn:
-        pinn = Tesseract.from_image(image_name)
-
-    params_flat = get_initial_params(backend, seed=data_config.seed)
 
     log_viscosity = jnp.log(jnp.asarray(problem.initial_viscosity))
     log_nu_bounds = None
@@ -867,138 +1272,51 @@ def train_inverse(config, *, pinn=None, callback=None, metrics_every=20):
 
     log_visc_optimizer = optax.adam(training.log_nu_learning_rate)
     log_visc_opt_state = log_visc_optimizer.init(log_viscosity)
-    param_optimizer = optax.adam(training.param_learning_rate)
-    param_opt_state = param_optimizer.init(params_flat)
-
-    loss_and_grads = jax.value_and_grad(_loss_from_log_and_params, argnums=(0, 1))
 
     viscosity = jnp.exp(log_viscosity)
     times = []
     viscosity_history = [float(viscosity)]
     log_viscosity_history = [float(log_viscosity)]
-    loss_history = {name: [] for name in ("total", "data", "physics", "ic", "bc")}
-    loss_weight_history = {name: [loss_weights[name]] for name in LOSS_WEIGHT_NAMES}
-    brdr_state = None
+    loss_history = {name: [] for name in strategy.loss_component_names}
 
-    def _run():
-        nonlocal log_viscosity, params_flat, viscosity
-        nonlocal log_visc_opt_state, param_opt_state, brdr_state
-
-        callback.on_start(
-            {
-                "config": config,
-                "backend": backend,
-                "image_name": image_name,
-                "warmup_epochs": warmup_epochs,
-                "x_obs": x_obs,
-                "t_obs": t_obs,
-                "u_obs": u_obs,
-            }
-        )
+    with ExitStack() as stack:
+        strategy.open_components(stack)
+        callback.on_start(strategy.start_context(warmup_epochs))
 
         for epoch in range(training.n_epochs):
             start_time = time.time()
-            viscosity = jnp.exp(log_viscosity)
-
-            brdr_weights = None
-            if training.adaptive_loss_weights:
-                pointwise_losses = compute_pointwise_losses(
-                    viscosity,
-                    params_flat,
-                    x_obs,
-                    t_obs,
-                    u_obs,
-                    x_col,
-                    t_col,
-                    x_ic,
-                    t_bc,
-                    pinn,
-                )
-                if brdr_state is None:
-                    brdr_state = initialize_brdr_state(pointwise_losses)
-                brdr_state = update_brdr_state(
-                    brdr_state,
-                    pointwise_losses,
-                    beta_c=training.brdr_beta_c,
-                    beta_w=training.brdr_beta_w,
-                    eps=training.brdr_epsilon,
-                )
-                brdr_weights = brdr_state["weights"]
-
-            # One reverse-mode sweep yields the loss and both gradients.
+            record = epoch % metrics_every == 0 or epoch == training.n_epochs - 1
             counter.reset()
+
+            # Count the complete epoch: adaptive-weight preparation, gradient pass,
+            # and any periodic loss-component evaluation.
             with count_tesseract_calls(counter):
-                loss, (log_v_grad, p_grad) = loss_and_grads(
-                    log_viscosity,
-                    params_flat,
-                    x_obs,
-                    t_obs,
-                    u_obs,
-                    x_col,
-                    t_col,
-                    x_ic,
-                    t_bc,
-                    pinn,
-                    brdr_weights,
-                    loss_weights,
-                )
-            apply_calls = counter.apply_calls
-            vjp_calls = counter.vjp_calls
+                step = strategy.run_step(log_viscosity, epoch)
 
-            visc_grad_norm = float(jnp.abs(log_v_grad))
-            param_grad_norm = float(jnp.linalg.norm(p_grad))
-
-            viscosity_updated = epoch >= warmup_epochs
-            if viscosity_updated:
-                log_visc_updates, log_visc_opt_state = log_visc_optimizer.update(
-                    log_v_grad, log_visc_opt_state
-                )
-                log_viscosity = optax.apply_updates(log_viscosity, log_visc_updates)
-                if log_nu_bounds is not None:
-                    log_viscosity = jnp.clip(
-                        log_viscosity, log_nu_bounds[0], log_nu_bounds[1]
+                viscosity_updated = epoch >= warmup_epochs
+                if viscosity_updated:
+                    updates, log_visc_opt_state = log_visc_optimizer.update(
+                        step.log_v_grad, log_visc_opt_state
                     )
+                    log_viscosity = optax.apply_updates(log_viscosity, updates)
+                    if log_nu_bounds is not None:
+                        log_viscosity = jnp.clip(
+                            log_viscosity, log_nu_bounds[0], log_nu_bounds[1]
+                        )
+                viscosity = jnp.exp(log_viscosity)
 
-            param_updates, param_opt_state = param_optimizer.update(
-                p_grad, param_opt_state
-            )
-            params_flat = optax.apply_updates(params_flat, param_updates)
-            viscosity = jnp.exp(log_viscosity)
+                components = strategy.epoch_loss_components(
+                    viscosity, log_viscosity, step, record
+                )
 
             epoch_time = time.time() - start_time
             times.append(epoch_time)
             viscosity_history.append(float(viscosity))
             log_viscosity_history.append(float(log_viscosity))
 
-            effective_weights = (
-                dict(loss_weights)
-                if brdr_weights is None
-                else summarize_brdr_weights(brdr_weights)
-            )
-            for name in LOSS_WEIGHT_NAMES:
-                loss_weight_history[name].append(effective_weights[name])
-
-            loss_components = None
-            if epoch % metrics_every == 0 or epoch == training.n_epochs - 1:
-                loss_components = {
-                    name: float(value)
-                    for name, value in compute_loss_components(
-                        viscosity,
-                        params_flat,
-                        x_obs,
-                        t_obs,
-                        u_obs,
-                        x_col,
-                        t_col,
-                        x_ic,
-                        t_bc,
-                        pinn,
-                        brdr_weights=brdr_weights,
-                        loss_weights=loss_weights,
-                    ).items()
-                }
-                for name, value in loss_components.items():
-                    loss_history[name].append(value)
+            if record and components is not None:
+                for name in loss_history:
+                    loss_history[name].append(components[name])
 
             callback.on_epoch(
                 EpochRecord(
@@ -1006,25 +1324,19 @@ def train_inverse(config, *, pinn=None, callback=None, metrics_every=20):
                     n_epochs=training.n_epochs,
                     viscosity=float(viscosity),
                     log_viscosity=float(log_viscosity),
-                    loss=float(loss),
-                    visc_grad_norm=visc_grad_norm,
-                    param_grad_norm=param_grad_norm,
+                    loss=float(step.loss),
+                    visc_grad_norm=float(jnp.abs(step.log_v_grad)),
+                    param_grad_norm=step.param_grad_norm,
                     epoch_time=epoch_time,
-                    apply_calls=apply_calls,
-                    vjp_calls=vjp_calls,
-                    effective_weights=effective_weights,
+                    apply_calls=counter.apply_calls,
+                    vjp_calls=counter.vjp_calls,
+                    effective_weights=step.effective_weights,
                     viscosity_updated=viscosity_updated,
-                    param_count=int(params_flat.size),
-                    brdr_weights=brdr_weights,
-                    loss_components=loss_components,
+                    param_count=step.param_count,
+                    brdr_weights=step.brdr_weights,
+                    loss_components=components,
                 )
             )
-
-    if owns_pinn:
-        with pinn:
-            _run()
-    else:
-        _run()
 
     final_viscosity = float(viscosity)
     relative_error = (
@@ -1032,9 +1344,7 @@ def train_inverse(config, *, pinn=None, callback=None, metrics_every=20):
     )
     avg_time = sum(times) / len(times) * 1000 if times else 0.0
 
-    result = {
-        "backend": backend,
-        "tesseract_image": image_name,
+    base = {
         "final_viscosity": final_viscosity,
         "true_viscosity": problem.true_viscosity,
         "relative_error": relative_error,
@@ -1042,18 +1352,439 @@ def train_inverse(config, *, pinn=None, callback=None, metrics_every=20):
         "viscosity_history": viscosity_history,
         "log_viscosity_history": log_viscosity_history,
         "loss_history": loss_history,
-        "loss_weights": loss_weights,
-        "loss_weight_history": loss_weight_history,
-        "brdr_state": brdr_state,
-        "adaptive_loss_weights": training.adaptive_loss_weights,
         "seed": data_config.seed,
         "config": config,
-        "params_flat": params_flat,
-        "warmup_epochs": warmup_epochs,
-        "observations": (x_obs, t_obs, u_obs),
-        "pinn": pinn,
     }
+    result = strategy.finalize_result(base)
     callback.on_finish(result)
+    return result
+
+
+def train_inverse(config, *, pinn=None, callback=None, metrics_every=20):
+    """Run the inverse-viscosity optimization loop (PINN method).
+
+    Thin wrapper over the shared engine with a :class:`PINNStrategy`: a single
+    reverse-mode `value_and_grad` over both ``log_nu`` and the PINN parameters
+    each step, routing gradients through the PINN Tesseract VJP. Presentation is
+    delegated to ``callback``.
+
+    Args:
+        config: a validated ``RunConfig``.
+        pinn: an already-open Tesseract. If ``None``, one is created from the
+            backend image and managed for the duration of the call.
+        callback: optional ``TrainingCallback`` for progress/visualization.
+        metrics_every: cadence (in epochs) for computing full loss components.
+    """
+    strategy = PINNStrategy(config, pinn=pinn)
+    return _run_inverse_training(
+        config, strategy, callback=callback, metrics_every=metrics_every
+    )
+
+
+#
+# Hybrid Stage 1: composed solver + discrepancy objective and training engine
+#
+
+
+def _solver_field(solver, nu, x_grid, t_grid, ic_amp=1.0, ic_phase=0.0):
+    """Run the in-loop viscous-Burgers solver Tesseract at the current parameters.
+
+    Differentiating the loss w.r.t. any of ``nu``/``ic_amp``/``ic_phase`` triggers
+    this Tesseract's VJP endpoint, so all three may be passed as traced values (e.g.
+    Stage-C multi-parameter refinement). They default to the canonical
+    ``u(x, 0) = sin(2πx)`` initial condition used by the single-parameter modes.
+    """
+    return apply_tesseract(
+        solver,
+        {
+            "nu": nu,
+            "x_grid": x_grid,
+            "t_grid": t_grid,
+            "ic_amp": jnp.asarray(ic_amp, dtype=jnp.float32),
+            "ic_phase": jnp.asarray(ic_phase, dtype=jnp.float32),
+        },
+    )["u_field"]
+
+
+def hybrid_discrepancy_loss(
+    log_viscosity,
+    params_flat,
+    obs,
+    x_reg,
+    t_reg,
+    solver,
+    pinn,
+    w_data,
+    w_reg,
+    w_smooth,
+):
+    """Composed hybrid objective `u_model = solver(nu) + delta`.
+
+    - Data term fits `solver(nu)[obs] + delta(obs)` to the sparse KdV observations.
+    - L2 (and optional smoothness) regularization keeps `delta` small so `nu` stays
+      identifiable.
+
+    Reverse-mode differentiation composes two Tesseract VJPs in one pass:
+    `dL/d(log nu)` through the JAX solver, `dL/d(params)` through the discrepancy
+    network (JAX or PyTorch). Returns `(total, components)` for `has_aux`.
+    """
+    nu = jnp.exp(log_viscosity)
+
+    u_field = _solver_field(solver, nu, obs.x_grid, obs.t_grid)
+    u_solver_obs = u_field[obs.t_idx, obs.x_idx]
+    delta_obs = apply_tesseract(
+        pinn, {"x": obs.x_obs, "t": obs.t_obs, "params_flat": params_flat}
+    )["u_pred"]
+    u_model = u_solver_obs + delta_obs
+    data_loss = jnp.mean((u_model - obs.u_obs) ** 2)
+
+    reg_out = apply_tesseract(
+        pinn, {"x": x_reg, "t": t_reg, "params_flat": params_flat}
+    )
+    reg_loss = jnp.mean(reg_out["u_pred"] ** 2)
+    smooth_loss = jnp.mean(reg_out["u_x"] ** 2)
+
+    total = w_data * data_loss + w_reg * reg_loss + w_smooth * smooth_loss
+    components = {
+        "total": total,
+        "data": data_loss,
+        "reg": reg_loss,
+        "smooth": smooth_loss,
+    }
+    return total, components
+
+
+class HybridDiscrepancyStrategy(InverseStrategy):
+    """Hybrid calibration-with-discrepancy (Stage-1 sidebar): jointly optimize
+    ``log_nu`` and a discrepancy network, composing the solver and PINN Tesseract
+    VJPs in one reverse-mode pass. A documented confounding *negative result*."""
+
+    loss_component_names = ("total", "data", "reg", "smooth")
+
+    def __init__(self, config, *, solver=None, pinn=None):
+        self.config = config
+        self.backend = config.backend
+        self.problem = config.problem
+        self.data_config = config.data
+        self.training = config.training
+        self.w_data = float(config.loss.data)
+        self.w_reg = float(self.training.discrepancy_reg_weight)
+        self.w_smooth = float(self.training.discrepancy_smooth_weight)
+        self.effective_weights = {
+            "data": self.w_data,
+            "reg": self.w_reg,
+            "smooth": self.w_smooth,
+        }
+        domain = self.problem.domain
+        key = jax.random.PRNGKey(self.data_config.seed)
+        key_obs, key_reg_x, key_reg_t = jax.random.split(key, 3)
+        self.obs = generate_kdv_observations(
+            self.data_config.n_obs,
+            self.problem.true_viscosity,
+            self.problem.dispersion_beta,
+            domain,
+            key_obs,
+            noise_std=self.data_config.noise_std,
+        )
+        self.x_reg = jax.random.uniform(
+            key_reg_x,
+            (self.training.n_col,),
+            minval=domain["x"][0],
+            maxval=domain["x"][1],
+        )
+        self.t_reg = jax.random.uniform(
+            key_reg_t,
+            (self.training.n_col,),
+            minval=MIN_OBS_TIME,
+            maxval=domain["t"][1],
+        )
+
+        self.image_name = image_name_for_backend(self.backend)
+        self.owns_pinn = pinn is None
+        self.owns_solver = solver is None
+        self.pinn = pinn if pinn is not None else Tesseract.from_image(self.image_name)
+        self.solver = (
+            solver if solver is not None else Tesseract.from_image("burgers_solver")
+        )
+
+        self.params_flat = get_initial_params(self.backend, seed=self.data_config.seed)
+        self.param_optimizer = optax.adam(self.training.param_learning_rate)
+        self.param_opt_state = self.param_optimizer.init(self.params_flat)
+        self.loss_and_grads = jax.value_and_grad(
+            hybrid_discrepancy_loss, argnums=(0, 1), has_aux=True
+        )
+
+    def open_components(self, stack):
+        if self.owns_pinn:
+            stack.enter_context(self.pinn)
+        if self.owns_solver:
+            stack.enter_context(self.solver)
+
+    def start_context(self, warmup_epochs):
+        return {
+            "config": self.config,
+            "backend": self.backend,
+            "image_name": self.image_name,
+            "solver_image": "burgers_solver",
+            "warmup_epochs": warmup_epochs,
+            "observations": self.obs,
+        }
+
+    def run_step(self, log_viscosity, epoch):
+        (loss, components), (log_v_grad, p_grad) = self.loss_and_grads(
+            log_viscosity,
+            self.params_flat,
+            self.obs,
+            self.x_reg,
+            self.t_reg,
+            self.solver,
+            self.pinn,
+            self.w_data,
+            self.w_reg,
+            self.w_smooth,
+        )
+
+        param_updates, self.param_opt_state = self.param_optimizer.update(
+            p_grad, self.param_opt_state
+        )
+        self.params_flat = optax.apply_updates(self.params_flat, param_updates)
+
+        return StepResult(
+            loss=float(loss),
+            log_v_grad=log_v_grad,
+            param_grad_norm=float(jnp.linalg.norm(p_grad)),
+            effective_weights=self.effective_weights,
+            param_count=int(self.params_flat.size),
+            aux={name: float(value) for name, value in components.items()},
+        )
+
+    def epoch_loss_components(self, viscosity, log_viscosity, step, record):
+        # Components come from the same backward pass every epoch (cheap aux).
+        return step.aux
+
+    def finalize_result(self, base):
+        return {
+            "mode": "hybrid",
+            "backend": self.backend,
+            "tesseract_image": self.image_name,
+            "solver_image": "burgers_solver",
+            **base,
+            "dispersion_beta": self.problem.dispersion_beta,
+            "effective_weights": self.effective_weights,
+            "params_flat": self.params_flat,
+            "observations": self.obs,
+            "pinn": self.pinn,
+            "solver": self.solver,
+        }
+
+
+def train_hybrid_inverse(
+    config, *, solver=None, pinn=None, callback=None, metrics_every=20
+):
+    """Run the hybrid calibration-with-discrepancy loop (Stage 1).
+
+    Thin wrapper over the shared engine with a :class:`HybridDiscrepancyStrategy`:
+    one reverse-mode `value_and_grad` over both ``log_nu`` and the discrepancy
+    network composes the solver and discrepancy Tesseract VJPs each step.
+    """
+    strategy = HybridDiscrepancyStrategy(config, solver=solver, pinn=pinn)
+    return _run_inverse_training(
+        config, strategy, callback=callback, metrics_every=metrics_every
+    )
+
+
+#
+# Stage A baseline: solver-adjoint inversion (jax.grad through the solver VJP)
+#
+
+
+def solver_inverse_loss(log_viscosity, obs, solver):
+    """Data-fit loss for solver-adjoint inversion: ``||solver(nu)[obs] - u_obs||^2``.
+
+    Differentiating w.r.t. ``log_viscosity`` routes entirely through the solver
+    Tesseract's VJP endpoint. No neural network is involved -- this is the
+    PDE-constrained / adjoint inverse method, a baseline for the PINN method.
+    """
+    nu = jnp.exp(log_viscosity)
+    u_field = _solver_field(solver, nu, obs.x_grid, obs.t_grid)
+    u_pred = u_field[obs.t_idx, obs.x_idx]
+    return jnp.mean((u_pred - obs.u_obs) ** 2)
+
+
+class SolverAdjointStrategy(InverseStrategy):
+    """Solver-adjoint inversion: optimize ``log_nu`` against the in-loop solver,
+    differentiating the data-fit loss through the solver Tesseract VJP. No neural
+    network — the PDE-constrained baseline for the PINN method."""
+
+    loss_component_names = ("total", "data")
+
+    def __init__(self, config, *, solver=None):
+        self.config = config
+        self.problem = config.problem
+        self.data_config = config.data
+        key = jax.random.PRNGKey(self.data_config.seed)
+        self.obs = generate_grid_observations(
+            self.data_config.n_obs,
+            self.problem.true_viscosity,
+            self.problem.domain,
+            key,
+            noise_std=self.data_config.noise_std,
+        )
+        self.owns_solver = solver is None
+        self.solver = (
+            solver if solver is not None else Tesseract.from_image("burgers_solver")
+        )
+        self.loss_and_grad = jax.value_and_grad(solver_inverse_loss, argnums=0)
+
+    def open_components(self, stack):
+        if self.owns_solver:
+            stack.enter_context(self.solver)
+
+    def start_context(self, warmup_epochs):
+        return {
+            "config": self.config,
+            "backend": "solver",
+            "image_name": "burgers_solver",
+            "warmup_epochs": warmup_epochs,
+            "observations": self.obs,
+        }
+
+    def run_step(self, log_viscosity, epoch):
+        loss, log_v_grad = self.loss_and_grad(log_viscosity, self.obs, self.solver)
+        return StepResult(
+            loss=float(loss),
+            log_v_grad=log_v_grad,
+            param_grad_norm=0.0,
+            effective_weights={},
+            param_count=0,
+        )
+
+    def epoch_loss_components(self, viscosity, log_viscosity, step, record):
+        return {"total": step.loss, "data": step.loss}
+
+    def finalize_result(self, base):
+        return {
+            "mode": "solver-inverse",
+            "backend": "solver",
+            "tesseract_image": "burgers_solver",
+            **base,
+            "observations": self.obs,
+            "solver": self.solver,
+        }
+
+
+def make_inverse_strategy(config, mode, *, pinn=None, solver=None):
+    """Factory: build the :class:`InverseStrategy` for an inverse ``mode``.
+
+    ``mode`` is one of ``"pinn"``, ``"solver-inverse"``, or ``"hybrid"``. Already
+    -open Tesseracts may be injected via ``pinn``/``solver``; otherwise the
+    strategy opens and manages its own.
+    """
+    if mode == "pinn":
+        return PINNStrategy(config, pinn=pinn)
+    if mode == "solver-inverse":
+        return SolverAdjointStrategy(config, solver=solver)
+    if mode == "hybrid":
+        return HybridDiscrepancyStrategy(config, solver=solver, pinn=pinn)
+    raise ValueError(f"Unknown inverse mode: {mode!r}")
+
+
+def train_solver_inverse(config, *, solver=None, callback=None, metrics_every=20):
+    """Run solver-adjoint inversion: optimize ``log_nu`` against the in-loop solver.
+
+    Thin wrapper over the shared engine with a :class:`SolverAdjointStrategy`.
+    One reverse-mode pass per step differentiates the data-fit loss through the
+    solver Tesseract VJP. Observations come from the same viscous-Burgers physics
+    (clean, well-posed inverse), so the estimate recovers ``nu`` up to noise.
+    """
+    strategy = SolverAdjointStrategy(config, solver=solver)
+    return _run_inverse_training(
+        config, strategy, callback=callback, metrics_every=metrics_every
+    )
+
+
+def log_solver_inverse_results(result):
+    """Log the solver-adjoint inversion result table."""
+    table = Table(title="Solver-Adjoint Inversion")
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right", style="cyan")
+    table.add_row("Inferred ν", f"{result['final_viscosity']:.6f}")
+    table.add_row("True ν", f"{result['true_viscosity']:.6f}")
+    table.add_row("Relative error", f"{result['relative_error']:.2f}%")
+    table.add_row("Avg time/epoch", f"{result['avg_time_ms']:.1f} ms")
+    if result["loss_history"]["data"]:
+        table.add_row("Final data loss", f"{result['loss_history']['data'][-1]:.6e}")
+    CONSOLE.print(table)
+
+
+class SolverInverseCallback(TrainingCallback):
+    """CLI presentation for solver-adjoint inversion: progress bar + results, and
+    records per-epoch metrics rows for reproducible artifacts."""
+
+    def __init__(self, config):
+        self.config = config
+        self.true_viscosity = config.problem.true_viscosity
+        self.progress = make_training_progress()
+        self.task_id = None
+        self._last_loss = None
+        self.rows = []
+
+    def on_start(self, context):
+        initial = float(self.config.problem.initial_viscosity)
+        CONSOLE.log("Solver-adjoint inversion (jax.grad through solver Tesseract VJP)")
+        self.progress.start()
+        self.task_id = self.progress.add_task(
+            "solver-inverse",
+            total=self.config.training.n_epochs,
+            loss="pending",
+            nu=f"{initial:.6f}",
+            error=f"{abs(initial - self.true_viscosity):.6f}",
+            epoch_time="pending",
+        )
+
+    def on_epoch(self, record):
+        if record.loss_components is not None:
+            self._last_loss = record.loss_components["total"]
+        loss_text = (
+            f"{self._last_loss:.3e}" if self._last_loss is not None else "pending"
+        )
+        self.progress.update(
+            self.task_id,
+            advance=1,
+            loss=loss_text,
+            nu=f"{record.viscosity:.6f}",
+            error=f"{abs(record.viscosity - self.true_viscosity):.6f}",
+            epoch_time=f"{record.epoch_time * 1000:.0f}ms",
+        )
+        self.rows.append(
+            {
+                "epoch": record.epoch,
+                "viscosity": record.viscosity,
+                "log_viscosity": record.log_viscosity,
+                "loss": record.loss,
+                "visc_grad_norm": record.visc_grad_norm,
+                "param_grad_norm": record.param_grad_norm,
+                "epoch_time": record.epoch_time,
+                "apply_calls": record.apply_calls,
+                "vjp_calls": record.vjp_calls,
+                "viscosity_updated": record.viscosity_updated,
+            }
+        )
+
+    def on_finish(self, result):
+        self.progress.stop()
+        log_solver_inverse_results(result)
+
+
+def run_solver_inverse(config):
+    """Run solver-adjoint inversion with CLI presentation and image guard."""
+    if config.problem.initial_viscosity <= 0:
+        raise ValueError("initial_viscosity must be positive when optimizing log_nu")
+    ensure_image_available("burgers_solver")
+    CONSOLE.rule("[bold cyan]Solver-Adjoint Inversion")
+    callback = SolverInverseCallback(config)
+    result = train_solver_inverse(config, callback=callback)
+    result["metrics_rows"] = callback.rows
     return result
 
 
@@ -1179,6 +1910,7 @@ def write_run_artifacts(result, rows, out_dir):
 
     last_row = rows[-1] if rows else {}
     summary = {
+        "mode": result.get("mode", "pinn"),
         "backend": result["backend"],
         "tesseract_image": result["tesseract_image"],
         "seed": result["seed"],
@@ -1189,7 +1921,7 @@ def write_run_artifacts(result, rows, out_dir):
         "epochs": len(result["viscosity_history"]) - 1,
         "apply_calls_per_step": last_row.get("apply_calls"),
         "vjp_calls_per_step": last_row.get("vjp_calls"),
-        "adaptive_loss_weights": result["adaptive_loss_weights"],
+        "adaptive_loss_weights": result.get("adaptive_loss_weights", False),
     }
     with (out_path / "summary.json").open("w", encoding="utf-8") as file:
         json.dump(_to_jsonable(summary), file, indent=2, sort_keys=True)
@@ -1331,6 +2063,58 @@ def run_single_backend(
     )
 
 
+def _last_call_counts(result):
+    """Return (apply, vjp) Tesseract dispatches per step from the last metrics row."""
+    rows = result.get("metrics_rows", [])
+    last = rows[-1] if rows else {}
+    return last.get("apply_calls"), last.get("vjp_calls")
+
+
+def log_method_comparison(results):
+    """Log a unified table comparing the inverse methods."""
+    table = Table(title="Inverse Method Comparison")
+    table.add_column("Method", style="bold")
+    table.add_column("Tesseract", style="dim")
+    table.add_column("Inferred ν", justify="right", style="cyan")
+    table.add_column("Rel error (%)", justify="right")
+    table.add_column("ms/epoch", justify="right")
+    table.add_column("apply/vjp per step", justify="right")
+
+    for label, result in results.items():
+        apply_calls, vjp_calls = _last_call_counts(result)
+        calls = (
+            f"{apply_calls}/{vjp_calls}"
+            if apply_calls is not None and vjp_calls is not None
+            else "-"
+        )
+        table.add_row(
+            label,
+            result["tesseract_image"],
+            f"{result['final_viscosity']:.6f}",
+            f"{result['relative_error']:.2f}",
+            f"{result['avg_time_ms']:.1f}",
+            calls,
+        )
+    CONSOLE.print(table)
+
+
+def compare_methods(config):
+    """Compare solver-adjoint inversion against the PINN method (JAX and PyTorch).
+
+    All three run on the same viscous-Burgers truth and data budget, exercising the
+    same uniform Tesseract interface across three swappable, framework-agnostic
+    components (the JAX solver and the JAX/PyTorch PINN). Observations are drawn
+    independently per method from the same physics and seed.
+    """
+    CONSOLE.rule("[bold cyan]Inverse Method Comparison")
+    results = {}
+    results["solver-adjoint"] = run_solver_inverse(config)
+    results["pinn (JAX)"] = run_single_backend(backend="jax", config=config)
+    results["pinn (PyTorch)"] = run_single_backend(backend="pytorch", config=config)
+    log_method_comparison(results)
+    return results
+
+
 def run_seed_sweep(
     backend="jax",
     seeds=(123,),
@@ -1405,10 +2189,20 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Inverse Problem Demo")
     parser.add_argument(
+        "--mode",
+        choices=["pinn", "solver-inverse", "compare"],
+        default="pinn",
+        help=(
+            "Inverse method: 'pinn' (jax.grad through the PINN Tesseract), "
+            "'solver-inverse' (solver-adjoint; jax.grad through the solver Tesseract), "
+            "or 'compare' (solver-adjoint vs PINN JAX/PyTorch in one table)"
+        ),
+    )
+    parser.add_argument(
         "--backend",
         choices=["jax", "pytorch", "both"],
         default="both",
-        help="Which backend to use",
+        help="Which PINN backend to use (pinn mode only)",
     )
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument(
@@ -1501,7 +2295,11 @@ if __name__ == "__main__":
     )
 
     try:
-        if args.seeds:
+        if args.mode == "solver-inverse":
+            results = run_solver_inverse(config=config)
+        elif args.mode == "compare":
+            results = compare_methods(config=config)
+        elif args.seeds:
             results = run_seed_sweep(
                 backend=args.backend,
                 seeds=args.seeds,

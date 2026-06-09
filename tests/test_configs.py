@@ -1,12 +1,8 @@
 """Tests for typed run configuration helpers."""
 
-import pathlib
-import sys
+import pytest
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
-
-from configs import LossWeights, RunConfig
+from configs import FMPEConfig, LossWeights, RunConfig
 from inverse_problem import build_run_config
 
 
@@ -56,3 +52,21 @@ def test_run_config_with_seed_preserves_other_fields():
     assert config.backend == "pytorch"
     assert config.data.seed == 4
     assert config.loss.data == 2.0
+
+
+def test_fmpe_config_validates_seed_and_prior_bounds():
+    config = FMPEConfig(
+        n_sims=100,
+        n_sensors=16,
+        sensor_seed=2,
+        simulation_seed=3,
+        training_seed=4,
+    )
+
+    assert config.simulation_seed == 3
+    assert config.training_seed == 4
+
+    with pytest.raises(ValueError, match="training_seed"):
+        FMPEConfig(training_seed=-1)
+    with pytest.raises(ValueError, match="lower bound"):
+        FMPEConfig(prior_low=(0.1, 0.8, -0.4))

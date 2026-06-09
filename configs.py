@@ -6,6 +6,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from math import isfinite
 
+# Default Gaussian sensor-noise standard deviation. Single source of truth shared
+# by the deterministic observation samplers and the FMPE simulator so the two paths
+# never silently disagree.
+DEFAULT_NOISE_STD = 0.02
+DEFAULT_FMPE_PRIOR_LOW = (0.02, 0.8, -0.4)
+DEFAULT_FMPE_PRIOR_HIGH = (0.10, 1.2, 0.4)
+
 
 def _check_positive(name, value):
     value = float(value)
@@ -31,10 +38,18 @@ class ProblemConfig:
     initial_viscosity: float = 0.01
     domain_x: tuple[float, float] = (0.0, 1.0)
     domain_t: tuple[float, float] = (0.0, 1.0)
+    # Dispersion coefficient of the KdV-Burgers truth (`-beta u_xxx`). This is the
+    # un-modeled physics the in-loop viscous-Burgers solver omits; the hybrid
+    # discrepancy term learns its effect. beta=0 reduces the truth to plain
+    # viscous Burgers (discrepancy collapses to zero — useful as a sanity check).
+    dispersion_beta: float = 1e-3
 
     def __post_init__(self):
         _check_positive("true_viscosity", self.true_viscosity)
         _check_positive("initial_viscosity", self.initial_viscosity)
+        beta = float(self.dispersion_beta)
+        if not isfinite(beta) or beta < 0:
+            raise ValueError("dispersion_beta must be a finite non-negative value")
         for name, bounds in (("domain_x", self.domain_x), ("domain_t", self.domain_t)):
             lo, hi = float(bounds[0]), float(bounds[1])
             if not (isfinite(lo) and isfinite(hi)):
@@ -52,7 +67,7 @@ class DataConfig:
     """Observation-generation configuration."""
 
     n_obs: int = 80
-    noise_std: float = 0.02
+    noise_std: float = DEFAULT_NOISE_STD
     seed: int = 123
 
     def __post_init__(self):
@@ -82,6 +97,11 @@ class TrainingConfig:
     clip_log_viscosity: bool = False
     nu_clip_min: float = 1e-4
     nu_clip_max: float = 0.5
+    # Hybrid-mode discrepancy regularization (Stage 1). The L2 weight keeps the
+    # learned discrepancy small so the physical viscosity stays identifiable; the
+    # optional smoothness weight penalizes the discrepancy's spatial gradient.
+    discrepancy_reg_weight: float = 1.0
+    discrepancy_smooth_weight: float = 0.0
 
     def __post_init__(self):
         if int(self.n_epochs) <= 0:
@@ -94,6 +114,10 @@ class TrainingConfig:
         for name in ("n_col", "n_ic", "n_bc"):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        for name in ("discrepancy_reg_weight", "discrepancy_smooth_weight"):
+            value = float(getattr(self, name))
+            if not isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite non-negative value")
         if int(self.viscosity_warmup_epochs) < 0:
             raise ValueError("viscosity_warmup_epochs must be non-negative")
         if self.clip_log_viscosity:
@@ -136,6 +160,48 @@ class RunConfig:
 
     def with_seed(self, seed: int):
         return replace(self, data=replace(self.data, seed=seed))
+
+
+@dataclass(frozen=True)
+class FMPEConfig:
+    """Reproducible configuration for FMPE simulation and training."""
+
+    n_sims: int = 4000
+    n_sensors: int = 64
+    noise_std: float = DEFAULT_NOISE_STD
+    sensor_seed: int = 0
+    simulation_seed: int = 0
+    training_seed: int = 1
+    device: str = "cpu"
+    max_num_epochs: int | None = None
+    show_train_summary: bool = False
+    prior_low: tuple[float, float, float] = DEFAULT_FMPE_PRIOR_LOW
+    prior_high: tuple[float, float, float] = DEFAULT_FMPE_PRIOR_HIGH
+
+    def __post_init__(self):
+        for name in ("n_sims", "n_sensors"):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if float(self.noise_std) < 0 or not isfinite(float(self.noise_std)):
+            raise ValueError("noise_std must be a finite non-negative value")
+        for name in ("sensor_seed", "simulation_seed", "training_seed"):
+            if int(getattr(self, name)) < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.max_num_epochs is not None and int(self.max_num_epochs) <= 0:
+            raise ValueError("max_num_epochs must be a positive integer or None")
+        if not self.device:
+            raise ValueError("device must be a non-empty string")
+        if len(self.prior_low) != 3 or len(self.prior_high) != 3:
+            raise ValueError("FMPE prior bounds must contain three parameters")
+        for index, (low, high) in enumerate(
+            zip(self.prior_low, self.prior_high, strict=True)
+        ):
+            if not (isfinite(float(low)) and isfinite(float(high))):
+                raise ValueError(f"FMPE prior bounds at index {index} must be finite")
+            if float(low) >= float(high):
+                raise ValueError(
+                    f"FMPE prior lower bound at index {index} must be less than upper"
+                )
 
 
 DEFAULT_LOSS_WEIGHTS = LossWeights().as_dict()

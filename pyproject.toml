@@ -17,16 +17,31 @@ dependencies = [
     "optax>=0.2.6",
     "pydantic>=2.12.5",
     "rich>=14.2.0",
+    "sbi>=0.26.1",
+    "scienceplots>=2.1.1",
     "seaborn>=0.13.2",
     "streamlit>=1.32.0",
     "tesseract-core[runtime]>=1.2.0",
     "tesseract-jax>=0.2.3",
     "torch>=2.9.1",
     "torchvision>=0.24.1",
+    "zuko>=1.6.0",
 ]
 
 [tool.setuptools]
-py-modules = ["app", "configs", "inverse_problem"]
+py-modules = [
+    "app",
+    "component_loader",
+    "configs",
+    "fmpe_posterior",
+    "inverse_problem",
+]
+packages = ["scripts"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: longer-running tests (e.g. FMPE training)",
+]
 
 [tool.ruff]
 line-length = 88
@@ -35,6 +50,3 @@ target-version = "py313"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/*.py" = ["E402"]

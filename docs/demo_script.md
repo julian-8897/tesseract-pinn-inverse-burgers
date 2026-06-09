@@ -47,8 +47,9 @@ and inspect the error panel.
 BRDR Weights: enable adaptive loss weights and show how the mean component
 weights evolve during training.
 
-Tesseract Trace: call out that apply and VJP counts are measured by wrapping the
-Tesseract JAX dispatch layer, not estimated.
+Tesseract Trace: call out that complete-epoch apply and VJP counts are measured
+by wrapping the Tesseract JAX dispatch layer, not estimated. Metric epochs and
+BRDR runs legitimately show additional `apply` calls.
 
 Backend Consistency: compare JAX and PyTorch runs with independent initial
 parameters under the same observation seed.

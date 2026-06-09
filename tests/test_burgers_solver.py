@@ -1,21 +1,16 @@
 """Smoke tests for the differentiable 1D Burgers pseudospectral solver."""
 
-import pathlib
-import sys
-
 import jax
 import jax.numpy as jnp
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "tesseracts" / "burgers_solver"))
+from component_loader import load_tesseract_api
 
-from tesseract_api import (  # noqa: E402
-    InputSchema,
-    apply_jit,
-    burgers_rhs,
-    solve_burgers,
-    vector_jacobian_product,
-)
+solver_api = load_tesseract_api("burgers_solver", module_name="burgers_solver_test_api")
+InputSchema = solver_api.InputSchema
+apply_jit = solver_api.apply_jit
+burgers_rhs = solver_api.burgers_rhs
+solve_burgers = solver_api.solve_burgers
+vector_jacobian_product = solver_api.vector_jacobian_product
 
 
 def make_grid(nx=64, nt=16):

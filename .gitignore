@@ -55,7 +55,11 @@ tesseract_cache/
 
 # Logs
 *.log
+*.log.*
+log/
+logs/
 runs/
+sbi-logs/
 
 # Local planning / agent notes
 AGENTS.md
@@ -65,3 +69,8 @@ TIER0_PLAN.md
 todo.md
 
 notes/
+
+# FMPE training artifacts (trained posteriors, large)
+artifacts/
+tesseracts/fmpe_posterior/posterior.pkl
+HANDOFF_CODEX.md

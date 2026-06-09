@@ -1,16 +1,10 @@
-import pathlib
-import sys
-
 import jax
 import jax.numpy as jnp
 import pytest
 from tesseract_core import Tesseract
 from tesseract_jax import apply_tesseract
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
-
-import inverse_problem as ip  # noqa: E402
+import inverse_problem as ip
 
 BACKENDS = ("jax", "pytorch")
 
