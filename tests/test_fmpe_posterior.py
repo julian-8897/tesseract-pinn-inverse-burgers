@@ -5,19 +5,13 @@ smoke trains a tiny FMPE posterior and checks the sampling interface; it is mark
 ``slow`` so the default suite stays quick.
 """
 
-import importlib.util
-import pathlib
-import sys
-
 import numpy as np
 import pytest
 import torch
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
-
-import fmpe_posterior as fp  # noqa: E402
-from configs import FMPEConfig  # noqa: E402
+import fmpe_posterior as fp
+from component_loader import load_tesseract_api
+from configs import FMPEConfig
 
 
 def test_prior_ranges():
@@ -160,12 +154,10 @@ def test_diagnostic_reports_are_machine_readable(tmp_path):
 
 
 def test_tesseract_runtime_rejects_wrong_observation_length():
-    module_path = REPO_ROOT / "tesseracts" / "fmpe_posterior" / "tesseract_api.py"
-    spec = importlib.util.spec_from_file_location(
-        "fmpe_tesseract_api_test", module_path
+    module = load_tesseract_api(
+        "fmpe_posterior",
+        module_name="fmpe_tesseract_api_test",
     )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
 
     class FakePosterior:
         def sample(self, shape, x, show_progress_bars=False):

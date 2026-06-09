@@ -38,6 +38,7 @@ from rich.table import Table
 from tesseract_core import Tesseract
 from tesseract_jax import apply_tesseract
 
+from component_loader import load_tesseract_api
 from configs import (
     DEFAULT_LOSS_WEIGHTS,
     DEFAULT_NOISE_STD,
@@ -48,7 +49,6 @@ from configs import (
     normalize_loss_weights,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent
 CONSOLE = Console()
 
 # Solver discretization grid. Shared by the forward solver, the observation
@@ -349,21 +349,8 @@ def log_seed_summary(results):
 
 
 def get_burgers_solver():
-    """Import the solver without leaving a conflicting tesseract_api module loaded."""
-    solver_path = str(REPO_ROOT / "tesseracts" / "burgers_solver")
-    previous_module = sys.modules.pop("tesseract_api", None)
-
-    sys.path.insert(0, solver_path)
-    try:
-        from tesseract_api import solve_burgers
-    finally:
-        sys.path.pop(0)
-        if "tesseract_api" in sys.modules:
-            del sys.modules["tesseract_api"]
-        if previous_module is not None:
-            sys.modules["tesseract_api"] = previous_module
-
-    return solve_burgers
+    """Load the in-process Burgers solver implementation."""
+    return load_tesseract_api("burgers_solver").solve_burgers
 
 
 def evaluate_pinn_solution_grid(
@@ -404,30 +391,22 @@ def evaluate_pinn_solution_grid(
 
 def get_initial_params(backend="jax", seed=42):
     """Get initial parameters for the specified backend."""
-    backend_path = REPO_ROOT / "tesseracts" / f"pinn_{backend}"
-    previous_module = sys.modules.pop("tesseract_api", None)
-    sys.path.insert(0, str(backend_path))
+    api = load_tesseract_api(f"pinn_{backend}")
 
     if backend == "jax":
         key = jax.random.PRNGKey(seed)
     else:  # pytorch
         torch.manual_seed(seed)
 
-    try:
-        from tesseract_api import PINNNet, flatten_params
-
-        if backend == "jax":
-            model = PINNNet(key)
-        else:
-            # For PyTorch, initialize from actual model for proper initialization.
-            model = PINNNet(hidden_sizes=[64, 64, 64], n_fourier_features=32, seed=seed)
-        return jnp.array(flatten_params(model))
-    finally:
-        sys.path.pop(0)
-        if "tesseract_api" in sys.modules:
-            del sys.modules["tesseract_api"]
-        if previous_module is not None:
-            sys.modules["tesseract_api"] = previous_module
+    if backend == "jax":
+        model = api.PINNNet(key)
+    else:
+        model = api.PINNNet(
+            hidden_sizes=[64, 64, 64],
+            n_fourier_features=32,
+            seed=seed,
+        )
+    return jnp.array(api.flatten_params(model))
 
 
 def generate_observations(

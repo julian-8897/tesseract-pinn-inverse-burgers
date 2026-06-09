@@ -29,7 +29,13 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["app", "configs", "inverse_problem", "fmpe_posterior"]
+py-modules = [
+    "app",
+    "component_loader",
+    "configs",
+    "fmpe_posterior",
+    "inverse_problem",
+]
 packages = ["scripts"]
 
 [tool.pytest.ini_options]
@@ -44,6 +50,3 @@ target-version = "py313"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/*.py" = ["E402"]

@@ -1,13 +1,7 @@
 """Tests for configurable PINN loss weights."""
 
-import pathlib
-import sys
-
 import jax.numpy as jnp
 import pytest
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
 
 from inverse_problem import (
     DEFAULT_LOSS_WEIGHTS,

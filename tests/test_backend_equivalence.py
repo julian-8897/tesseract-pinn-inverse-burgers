@@ -1,25 +1,17 @@
 """Backend contract tests for the JAX and PyTorch PINN implementations."""
 
-import importlib.util
-import pathlib
-
 import jax
 import numpy as np
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+from component_loader import load_tesseract_api
 
-
-def load_tesseract_api(module_name, relative_path):
-    module_path = REPO_ROOT / relative_path / "tesseract_api.py"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-jax_api = load_tesseract_api("pinn_jax_api_for_equivalence", "tesseracts/pinn_jax")
+jax_api = load_tesseract_api(
+    "pinn_jax",
+    module_name="pinn_jax_api_for_equivalence",
+)
 torch_api = load_tesseract_api(
-    "pinn_torch_api_for_equivalence", "tesseracts/pinn_pytorch"
+    "pinn_pytorch",
+    module_name="pinn_torch_api_for_equivalence",
 )
 
 

@@ -1,14 +1,8 @@
 """Regression tests for inverse-problem observation generation."""
 
-import pathlib
-import sys
-
 import jax
 import jax.numpy as jnp
 import numpy as np
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
 
 import inverse_problem as ip
 

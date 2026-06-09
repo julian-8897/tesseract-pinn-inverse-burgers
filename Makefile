@@ -1,7 +1,7 @@
 .PHONY: compile lint format test test-slow build-tesseracts train-posterior posterior-calibration plot-sbi plot-pinn smoke benchmark run-cli run-app
 
 compile:
-	uv run python -m compileall -q app.py configs.py fmpe_posterior.py inverse_problem.py scripts tests tesseracts
+	uv run python -m compileall -q app.py component_loader.py configs.py fmpe_posterior.py inverse_problem.py scripts tests tesseracts
 
 lint:
 	uv run --with ruff ruff check .

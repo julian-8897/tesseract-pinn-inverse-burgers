@@ -7,19 +7,13 @@ the in-loop solver recovers the viscosity. A Docker-gated integration test then
 exercises the full composed Tesseract path (solver + discrepancy VJPs).
 """
 
-import pathlib
-import sys
-
 import jax
 import jax.numpy as jnp
 import optax
 import pytest
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
-
-import inverse_problem as ip  # noqa: E402
-from configs import (  # noqa: E402
+import inverse_problem as ip
+from configs import (
     DataConfig,
     ProblemConfig,
     RunConfig,

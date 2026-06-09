@@ -1,13 +1,7 @@
 """Tests for log-space viscosity optimization helpers."""
 
-import pathlib
-import sys
-
 import jax.numpy as jnp
 import pytest
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
 
 import inverse_problem
 

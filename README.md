@@ -187,6 +187,7 @@ scripts call the same training path without duplicating defaults.
 
 ```
 tesseract-pinn-inverse-burgers/
+├── component_loader.py        # Conflict-free local Tesseract API loading
 ├── configs.py                 # Deterministic inverse and FMPE configurations
 ├── inverse_problem.py         # Deterministic inverse methods and shared engine
 ├── fmpe_posterior.py          # FMPE simulation, training, bundles, diagnostics

@@ -55,14 +55,17 @@ tesseract_cache/
 
 # Logs
 *.log
+*.log.*
+log/
+logs/
 runs/
+sbi-logs/
 
 # Local planning / agent notes
 AGENTS.md
 CLAUDE.md
 PLAN.md
 TIER0_PLAN.md
-INVERSE_FMPE_PLAN.md
 todo.md
 
 notes/
@@ -71,4 +74,3 @@ notes/
 artifacts/
 tesseracts/fmpe_posterior/posterior.pkl
 HANDOFF_CODEX.md
-sbi-logs/
