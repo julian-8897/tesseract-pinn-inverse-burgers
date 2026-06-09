@@ -300,15 +300,28 @@ When `--out` is set, the CLI writes artifacts under
 uv run streamlit run app.py
 ```
 
-The Streamlit app provides:
-- Adjustable hyperparameters, observation counts, collocation counts, loss weights, viscosity warmup, and optional viscosity clipping
-- Real-time training visualization
-- Optional BRDR adaptive loss weighting and component mean-weight plots
-- Tesseract trace panel with measured apply/VJP call counts
-- Solution field plots against solver ground truth
-- Backend consistency report for JAX vs PyTorch runs
+The app exposes all three swappable Tesseracts behind one sidebar **method**
+selector — each method makes a *different* Tesseract the active boundary of the
+same inverse problem:
 
-The CLI is the reference path for dataclass configs and seeded runs. The Streamlit app follows the same solver-backed observation generation, `log_nu` optimization, and optional adaptive loss-weighting path for interactive runs.
+- **Solver-adjoint inversion** — optimize `log_nu` by differentiating the data-fit
+  loss through the `burgers_solver` Tesseract VJP (the PDE-constrained baseline);
+  live convergence plus the recovered solver field vs. ground truth. *Requires the
+  `burgers_solver` image.*
+- **PINN inversion (JAX ↔ PyTorch)** — the cross-framework showcase: adjustable
+  hyperparameters/sampling/loss weights, viscosity warmup and clipping, optional
+  BRDR adaptive weighting with mean-weight plots, a Tesseract trace panel with
+  measured apply/VJP call counts, PINN-vs-solver field plots, and a JAX/PyTorch
+  backend consistency report. *Requires the `pinn_jax` / `pinn_pytorch` images.*
+- **FMPE posterior (UQ)** — pick a ground-truth `(nu, ic_amp, ic_phase)`; the solver
+  builds a noisy observation at the trained sensor layout and the apply-only
+  `fmpe_posterior` Tesseract returns a full posterior in one forward pass, rendered
+  as marginals, a corner plot, a coverage summary, and the calibration caveat. *Runs
+  fully in-process — no Docker image required, only the trained `posterior.pkl`.*
+
+The CLI is the reference path for dataclass configs and seeded runs; the app and
+CLI share the same callback-driven training engines (`train_inverse`,
+`train_solver_inverse`) and the same packaged `fmpe_posterior` component.
 
 ### Uncertainty quantification (amortized flow-matching posterior)
 

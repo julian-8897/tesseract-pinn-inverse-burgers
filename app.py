@@ -1,7 +1,15 @@
-"""Tesseract Cross-Framework Autodiff Demo: Inverse Burgers Equation Solver.
+"""Tesseract Swappable-Components Demo: Inverse Burgers Equation.
 
-Demonstrates Tesseract's pipeline-level automatic differentiation across JAX and PyTorch,
-enabling JAX-based optimization of PyTorch PINN models via VJP (Vector-Jacobian Product).
+Showcases Tesseract as a registry of framework-agnostic, swappable, differentiable
+model components. Three independent Tesseracts solve one inverse problem three ways:
+
+- **Solver-adjoint inversion**: ``jax.grad`` through the differentiable Burgers
+  *solver* Tesseract VJP (PDE-constrained baseline).
+- **PINN inversion**: ``jax.grad`` through the *PINN* Tesseract VJP, with the
+  backend swappable between JAX and PyTorch (cross-framework autodiff).
+- **Amortized posterior (FMPE)**: the apply-only *flow-matching posterior*
+  Tesseract turns one sparse observation into a full posterior over the Burgers
+  parameters — uncertainty quantification rather than a point estimate.
 """
 
 import json
@@ -27,12 +35,14 @@ from inverse_problem import (
     TrainingCallback,
     docker_image_available,
     evaluate_pinn_solution_grid,
+    get_burgers_solver,
     image_name_for_backend,
     train_inverse,
+    train_solver_inverse,
 )
 
 st.set_page_config(
-    page_title="Tesseract Cross-Framework Autodiff Demo",
+    page_title="Tesseract Swappable Components — Inverse Burgers",
     page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -489,12 +499,12 @@ class StreamlitTrainingCallback(TrainingCallback):
             plt.close(fig3)
 
 
-def main():
-    initialize_session_state()
-
-    st.title("Tesseract Cross-Framework Autodiff Showcase")
-    st.subheader(
-        "One JAX inverse-problem loop, swappable JAX and PyTorch PINN containers"
+def render_pinn_demo():
+    """PINN inversion with swappable JAX / PyTorch Tesseract containers."""
+    st.header("PINN inversion — swappable JAX / PyTorch containers")
+    st.caption(
+        "Method 2 of 3 · `jax.grad` flows through the PINN Tesseract VJP; the PINN "
+        "backend swaps between JAX and PyTorch with identical calling code."
     )
 
     st.markdown("""
@@ -534,7 +544,10 @@ updates for log_nu and params_flat""",
             r"\frac{\partial u}{\partial t} + u \frac{\partial u}{\partial x} = \nu \frac{\partial^2 u}{\partial x^2}"
         )
         st.caption(
-            "The Burgers solver currently generates fixed observations offline; the active Tesseract boundary in this app is the PINN container."
+            "In this PINN method the solver Tesseract generates the noisy observations offline; "
+            "the active autodiff boundary is the PINN container. The other two methods "
+            "(solver-adjoint inversion and the FMPE posterior) make the solver and posterior "
+            "Tesseracts the active boundary — switch methods in the sidebar."
         )
 
     st.sidebar.header("Configuration")
@@ -1280,6 +1293,570 @@ updates for log_nu and params_flat""",
                 st.info(
                     "Train the other Tesseract container to populate the backend consistency report."
                 )
+
+
+class SolverStreamlitCallback(TrainingCallback):
+    """Live Streamlit progress for solver-adjoint inversion (no neural net)."""
+
+    def __init__(self, *, true_viscosity, initial_viscosity, placeholders):
+        self.true_viscosity = true_viscosity
+        self.ph = placeholders
+        self.visc_history = [float(initial_viscosity)]
+        self.loss_history = []
+        self.time_history = []
+        self.observations = None
+
+    def on_start(self, context):
+        self.observations = context["observations"]
+
+    def on_epoch(self, record):
+        self.visc_history.append(record.viscosity)
+        self.loss_history.append(record.loss)
+        self.time_history.append(record.epoch_time)
+        if record.epoch % 5 == 0 or record.epoch == record.n_epochs - 1:
+            self._render_live(record)
+
+    def _render_live(self, record):
+        progress = (record.epoch + 1) / record.n_epochs
+        self.ph["progress_bar"].progress(progress)
+        self.ph["status_text"].text(f"Epoch {record.epoch + 1}/{record.n_epochs}")
+        rel_error = abs(record.viscosity - self.true_viscosity) / self.true_viscosity
+        self.ph["metric_visc"].metric(
+            "Current ν",
+            f"{record.viscosity:.6f}",
+            delta=f"{record.viscosity - self.true_viscosity:.6f}",
+        )
+        self.ph["metric_error"].metric("Relative Error", f"{rel_error * 100:.2f}%")
+        self.ph["metric_loss"].metric("Data Loss", f"{record.loss:.3e}")
+        self.ph["metric_time"].metric("Epoch Time", f"{record.epoch_time * 1000:.1f}ms")
+
+        fig1, ax1 = plt.subplots(figsize=(6, 4))
+        sns.lineplot(
+            x=np.arange(len(self.visc_history)),
+            y=self.visc_history,
+            label="Inferred ν",
+            color=PINN_COLOR,
+            linewidth=2.3,
+            ax=ax1,
+        )
+        ax1.axhline(
+            self.true_viscosity,
+            color=TRUE_COLOR,
+            linestyle="--",
+            linewidth=2,
+            label=f"True ν = {self.true_viscosity}",
+        )
+        ax1.set_xlabel("Epoch")
+        ax1.set_ylabel("Viscosity")
+        ax1.legend(frameon=False)
+        finish_axes(ax1)
+        self.ph["visc_chart"].pyplot(fig1)
+        plt.close(fig1)
+
+        fig2, ax2 = plt.subplots(figsize=(6, 4))
+        sns.lineplot(
+            x=np.arange(len(self.loss_history)),
+            y=self.loss_history,
+            color=LOSS_COLOR,
+            linewidth=2.3,
+            ax=ax2,
+        )
+        ax2.set_yscale("log")
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("Data loss (log scale)")
+        finish_axes(ax2)
+        self.ph["loss_chart"].pyplot(fig2)
+        plt.close(fig2)
+
+
+FMPE_BUNDLE_PATH = "tesseracts/fmpe_posterior/posterior.pkl"
+
+
+@st.cache_resource(show_spinner=False)
+def load_fmpe_bundle(path):
+    """Load and validate the trained FMPE posterior bundle (cached)."""
+    from pathlib import Path
+
+    if not Path(path).is_file():
+        return None
+    from fmpe_posterior import load_model
+
+    return load_model(path)
+
+
+@st.cache_resource(show_spinner=False)
+def get_fmpe_component():
+    """Load the local fmpe_posterior Tesseract API (apply-only component)."""
+    from component_loader import load_tesseract_api
+
+    return load_tesseract_api("fmpe_posterior")
+
+
+def render_app_header():
+    """Shared three-Tesseract framing shown above every method."""
+    st.title("Tesseract Swappable Components — Inverse Burgers")
+    st.subheader(
+        "One inverse problem, three independent Tesseracts behind one uniform schema"
+    )
+    st.markdown(
+        """
+This project treats **Tesseract as a registry of framework-agnostic, swappable,
+differentiable model components**. The physics **solver**, the **PINN** surrogate,
+and the **posterior** sampler are each packaged as an independent Tesseract with the
+same typed `apply` contract — so you swap a JAX component for a PyTorch one (or a
+deterministic estimate for a full posterior) by changing an image name, with
+identical calling code and no shared environment.
+        """
+    )
+    col1, col2, col3 = st.columns(3)
+    col1.metric(
+        "① Solver Tesseract",
+        "burgers_solver",
+        help="JAX pseudospectral solver; differentiable (VJP/JVP)",
+    )
+    col2.metric(
+        "② PINN Tesseract",
+        "pinn_jax / pinn_pytorch",
+        help="Swappable JAX or PyTorch backend; differentiable (VJP)",
+    )
+    col3.metric(
+        "③ Posterior Tesseract",
+        "fmpe_posterior",
+        help="Amortized flow-matching posterior; apply-only (no VJP)",
+    )
+    st.caption(
+        "Pick a method in the sidebar. Each one makes a *different* Tesseract the "
+        "active boundary of the same inverse problem."
+    )
+
+
+def render_solver_demo():
+    """Solver-adjoint inversion: differentiate through the solver Tesseract VJP."""
+    st.header("Solver-adjoint inversion — differentiate through the solver Tesseract")
+    st.caption(
+        "Method 1 of 3 · `jax.grad` flows entirely through the Burgers *solver* "
+        "Tesseract VJP. No neural network — the PDE-constrained baseline."
+    )
+    st.markdown(
+        """
+        The objective is a pure data fit, ``L(ν) = ‖solver(ν)[sensors] − u_obs‖²``.
+        Optimizing ``log ν`` with Optax differentiates this loss through the solver
+        Tesseract's reverse-mode endpoint, so the gradient is the PDE adjoint. Because
+        the observations come from the *same* viscous-Burgers physics, this inverse
+        problem is well-posed and recovers ``ν`` up to the observation noise.
+        """
+    )
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Host Loop", "JAX + Optax")
+    col2.metric("Autodiff Boundary", "Solver Tesseract VJP")
+    col3.metric("Tesseract", "burgers_solver")
+    st.code(
+        """noisy sparse observations u_obs
+        |
+        v
+JAX objective: ||solver(nu)[sensors] - u_obs||^2
+        |
+        v
+jax.grad(loss) w.r.t. log_nu
+        |
+        v
+Tesseract solver container: burgers_solver VJP (PDE adjoint)
+        |
+        v
+update for log_nu""",
+        language="text",
+    )
+
+    st.sidebar.header("Configuration")
+    seed = st.sidebar.number_input(
+        "Seed", min_value=0, max_value=1_000_000, value=123, step=1, key="solver_seed"
+    )
+    true_viscosity = st.sidebar.slider(
+        "True Viscosity $\\nu$ (Ground Truth)",
+        min_value=0.01,
+        max_value=0.2,
+        value=0.05,
+        step=0.01,
+        key="solver_true_nu",
+    )
+    initial_viscosity = st.sidebar.slider(
+        "Initial Viscosity Guess $\\nu_0$",
+        min_value=0.001,
+        max_value=0.1,
+        value=0.01,
+        step=0.001,
+        key="solver_init_nu",
+    )
+    n_obs = st.sidebar.slider(
+        "Number of Observations",
+        min_value=20,
+        max_value=400,
+        value=200,
+        step=20,
+        key="solver_n_obs",
+    )
+    noise_level = st.sidebar.slider(
+        "Observation Noise (σ)",
+        min_value=0.0,
+        max_value=0.1,
+        value=0.02,
+        step=0.01,
+        key="solver_noise",
+    )
+    n_epochs = st.sidebar.slider(
+        "Training Epochs",
+        min_value=10,
+        max_value=300,
+        value=80,
+        step=10,
+        key="solver_epochs",
+    )
+    learning_rate = st.sidebar.slider(
+        "Log-Viscosity Learning Rate",
+        min_value=0.001,
+        max_value=0.3,
+        value=0.05,
+        step=0.001,
+        format="%.3f",
+        key="solver_lr",
+    )
+    clip_log_viscosity = st.sidebar.checkbox(
+        "Constrain Viscosity Range", value=True, key="solver_clip"
+    )
+
+    if not st.sidebar.button(
+        "Run Solver-Adjoint Inversion", type="primary", key="solver_run"
+    ):
+        st.info(
+            "Configure parameters in the sidebar and click **Run Solver-Adjoint "
+            "Inversion**. This method requires the `burgers_solver` Tesseract image."
+        )
+        return
+
+    try:
+        config = RunConfig(
+            backend="jax",
+            problem=ProblemConfig(
+                true_viscosity=float(true_viscosity),
+                initial_viscosity=float(initial_viscosity),
+            ),
+            data=DataConfig(
+                n_obs=int(n_obs), noise_std=float(noise_level), seed=int(seed)
+            ),
+            training=TrainingConfig(
+                n_epochs=int(n_epochs),
+                log_nu_learning_rate=float(learning_rate),
+                viscosity_warmup_epochs=0,
+                clip_log_viscosity=bool(clip_log_viscosity),
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        st.error(f"Invalid configuration: {exc}")
+        return
+
+    if not docker_image_available("burgers_solver"):
+        st.error("Tesseract image `burgers_solver` was not found.")
+        st.code("./buildall.sh", language="bash")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Container", "burgers_solver")
+    col2.metric("Method", "Solver adjoint")
+    col3.metric("True Viscosity", f"{true_viscosity:.4f}")
+    col4.metric("Initial Guess", f"{initial_viscosity:.4f}")
+    st.markdown("---")
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    m1, m2, m3, m4 = st.columns(4)
+    plot_cols = st.columns(2)
+    with plot_cols[0]:
+        st.subheader("Viscosity Convergence")
+        visc_chart = st.empty()
+    with plot_cols[1]:
+        st.subheader("Data Loss")
+        loss_chart = st.empty()
+
+    callback = SolverStreamlitCallback(
+        true_viscosity=true_viscosity,
+        initial_viscosity=initial_viscosity,
+        placeholders={
+            "progress_bar": progress_bar,
+            "status_text": status_text,
+            "metric_visc": m1.empty(),
+            "metric_error": m2.empty(),
+            "metric_loss": m3.empty(),
+            "metric_time": m4.empty(),
+            "visc_chart": visc_chart,
+            "loss_chart": loss_chart,
+        },
+    )
+
+    solver = Tesseract.from_image("burgers_solver")
+    with solver:
+        result = train_solver_inverse(
+            config, solver=solver, callback=callback, metrics_every=5
+        )
+
+    st.markdown("---")
+    st.success("Finished solver-adjoint inversion.")
+    final_visc = result["final_viscosity"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Final Viscosity", f"{final_visc:.6f}")
+    c2.metric("True Viscosity", f"{true_viscosity:.6f}")
+    c3.metric("Relative Error", f"{result['relative_error']:.2f}%")
+    c4.metric("Avg Time/Epoch", f"{np.mean(callback.time_history) * 1000:.1f}ms")
+
+    st.subheader("Solver Field at Recovered ν vs. Ground Truth")
+    with st.spinner("Rendering solver fields..."):
+        obs = result["observations"]
+        x_grid = np.asarray(obs.x_grid)
+        t_grid = np.asarray(obs.t_grid)
+        solve_burgers = get_burgers_solver()
+        one = np.float32(1.0)
+        zero = np.float32(0.0)
+        u_pred = np.asarray(
+            solve_burgers(np.float32(final_visc), x_grid, t_grid, one, zero)
+        )
+        u_true = np.asarray(
+            solve_burgers(np.float32(true_viscosity), x_grid, t_grid, one, zero)
+        )
+    X, T = np.meshgrid(x_grid, t_grid)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    im0 = axes[0].contourf(X, T, u_pred, levels=32, cmap=FIELD_CMAP)
+    axes[0].set_title(f"Solver Field (recovered ν={final_visc:.4f})")
+    plt.colorbar(im0, ax=axes[0])
+    axes[0].scatter(
+        np.asarray(obs.x_obs),
+        np.asarray(obs.t_obs),
+        c="white",
+        edgecolors="#222222",
+        linewidths=0.25,
+        s=14,
+        alpha=0.75,
+        label="Observations",
+    )
+    axes[0].legend(frameon=False, loc="upper right")
+    im1 = axes[1].contourf(X, T, u_true, levels=32, cmap=FIELD_CMAP)
+    axes[1].set_title(f"Ground Truth (ν={true_viscosity:.4f})")
+    plt.colorbar(im1, ax=axes[1])
+    err = np.abs(u_pred - u_true)
+    im2 = axes[2].contourf(X, T, err, levels=32, cmap=ERROR_CMAP)
+    axes[2].set_title(f"Absolute Error (Max: {err.max():.4f})")
+    plt.colorbar(im2, ax=axes[2])
+    for ax in axes:
+        ax.set_xlabel("x")
+        ax.set_ylabel("t")
+        finish_axes(ax)
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def render_fmpe_demo():
+    """Amortized FMPE posterior: the apply-only posterior Tesseract (UQ)."""
+    st.header("Amortized posterior — FMPE (uncertainty quantification)")
+    st.caption(
+        "Method 3 of 3 · the apply-only *flow-matching posterior* Tesseract maps one "
+        "sparse observation to a full posterior over (ν, ic_amp, ic_phase)."
+    )
+    st.markdown(
+        """
+        Instead of a point estimate, an amortized **Flow Matching Posterior Estimator**
+        (trained offline with `sbi` + `zuko`) returns the full posterior in a single
+        forward pass. It is packaged as the **third swappable Tesseract**
+        (`fmpe_posterior`) — apply-only, so it exposes *no* VJP/JVP endpoints, unlike
+        the differentiable solver and PINN components.
+        """
+    )
+
+    bundle = load_fmpe_bundle(FMPE_BUNDLE_PATH)
+    if bundle is None:
+        st.warning(
+            "No trained posterior found at "
+            f"`{FMPE_BUNDLE_PATH}`. Train it first (the bundle is gitignored — it is "
+            "large and reproducible):"
+        )
+        st.code("make train-posterior", language="bash")
+        return
+
+    contract = bundle["metadata"]["contract"]
+    sensors = bundle["sensors"]
+    param_names = list(contract["param_names"])
+    prior_low = list(contract["prior_low"])
+    prior_high = list(contract["prior_high"])
+    noise_std = float(contract["noise_std"])
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Tesseract", "fmpe_posterior")
+    col2.metric("Endpoint", "apply only")
+    col3.metric("Sensors (obs dim)", str(int(contract["observation_dim"])))
+    st.caption(
+        f"Posterior contract `model_id`: `{bundle['metadata']['model_id'][:16]}…`"
+    )
+
+    st.sidebar.header("Ground-truth parameters")
+    st.sidebar.caption(
+        "Pick a true (ν, ic_amp, ic_phase) inside the training prior. The solver "
+        "generates a noisy observation at the trained sensor layout; the posterior "
+        "Tesseract then infers the parameters back."
+    )
+    nice_labels = {
+        "nu": "Viscosity ν",
+        "ic_amp": "IC amplitude",
+        "ic_phase": "IC phase",
+    }
+    theta_true = []
+    for i, name in enumerate(param_names):
+        lo, hi = float(prior_low[i]), float(prior_high[i])
+        theta_true.append(
+            st.sidebar.slider(
+                nice_labels.get(name, name),
+                min_value=lo,
+                max_value=hi,
+                value=float((lo + hi) / 2.0),
+                step=(hi - lo) / 100.0,
+                key=f"fmpe_{name}",
+            )
+        )
+    obs_seed = st.sidebar.number_input(
+        "Observation noise seed",
+        min_value=0,
+        max_value=1_000_000,
+        value=1234,
+        step=1,
+        key="fmpe_obs_seed",
+    )
+    sample_seed = st.sidebar.number_input(
+        "Posterior sampling seed",
+        min_value=0,
+        max_value=1_000_000,
+        value=0,
+        step=1,
+        key="fmpe_sample_seed",
+    )
+
+    if not st.sidebar.button("Sample Posterior", type="primary", key="fmpe_run"):
+        st.info(
+            "Choose ground-truth parameters in the sidebar and click **Sample "
+            "Posterior**. Runs fully in-process — no Docker image required."
+        )
+        return
+
+    with st.spinner("Simulating observation and sampling the posterior Tesseract..."):
+        from fmpe_posterior import observation_from_theta
+
+        observation = (
+            np.asarray(
+                observation_from_theta(
+                    tuple(theta_true), sensors, noise_std=noise_std, seed=int(obs_seed)
+                )
+            )
+            .ravel()
+            .astype(np.float32)
+        )
+
+        component = get_fmpe_component()
+        out = component.apply(
+            component.InputSchema(observation=observation, seed=int(sample_seed))
+        )
+
+    samples = np.asarray(out.samples, dtype=np.float64)
+    mean = np.asarray(out.mean, dtype=np.float64)
+    q05 = np.asarray(out.q05, dtype=np.float64)
+    q95 = np.asarray(out.q95, dtype=np.float64)
+
+    st.success(f"Drew {samples.shape[0]} posterior samples in one apply() call.")
+
+    st.subheader("Posterior marginals")
+    fig, axes = plt.subplots(1, len(param_names), figsize=(6 * len(param_names), 4))
+    if len(param_names) == 1:
+        axes = [axes]
+    for i, name in enumerate(param_names):
+        ax = axes[i]
+        sns.histplot(samples[:, i], bins=40, color=PINN_COLOR, stat="density", ax=ax)
+        ax.axvspan(q05[i], q95[i], color=PARAM_GRAD_COLOR, alpha=0.15, label="90% CI")
+        ax.axvline(
+            theta_true[i], color=TRUE_COLOR, linestyle="--", linewidth=2, label="Truth"
+        )
+        ax.axvline(
+            mean[i], color="#333333", linestyle=":", linewidth=1.5, label="Post. mean"
+        )
+        ax.set_title(nice_labels.get(name, name))
+        ax.set_xlabel(name)
+        ax.legend(frameon=False)
+        finish_axes(ax)
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    st.subheader("Joint posterior (corner)")
+    sample_df = pd.DataFrame(samples, columns=param_names)
+    grid = sns.pairplot(
+        sample_df, corner=True, diag_kind="hist", plot_kws=dict(s=6, alpha=0.15)
+    )
+    for i in range(len(param_names)):
+        for j in range(len(param_names)):
+            ax = grid.axes[i][j]
+            if ax is None:
+                continue
+            if i == j:
+                ax.axvline(
+                    theta_true[i], color=TRUE_COLOR, linestyle="--", linewidth=1.5
+                )
+            elif j < i:
+                ax.axvline(
+                    theta_true[j], color=TRUE_COLOR, linestyle="--", linewidth=1.0
+                )
+                ax.axhline(
+                    theta_true[i], color=TRUE_COLOR, linestyle="--", linewidth=1.0
+                )
+    st.pyplot(grid.figure)
+    plt.close(grid.figure)
+
+    st.subheader("Per-parameter summary")
+    summary = pd.DataFrame(
+        {
+            "parameter": param_names,
+            "truth": [float(v) for v in theta_true],
+            "posterior_mean": mean,
+            "q05": q05,
+            "q95": q95,
+            "covered_90%": [
+                bool(q05[i] <= theta_true[i] <= q95[i]) for i in range(len(param_names))
+            ],
+        }
+    )
+    st.dataframe(summary, hide_index=True)
+
+    st.info(
+        "**Calibration caveat (reported honestly):** reference SBC/TARP diagnostics show "
+        "joint coverage is calibrated and the IC marginals pass, but the **ν marginal is "
+        "mildly overconfident** (SBC c2st ≈ 0.63). Treat the ν credible interval as a "
+        "lower bound on its true width. See the README's UQ section and "
+        "`scripts/fmpe_diagnostics.py`."
+    )
+
+
+def main():
+    initialize_session_state()
+    render_app_header()
+    st.markdown("---")
+
+    method = st.sidebar.radio(
+        "Inverse method (which Tesseract is the boundary)",
+        ("Solver-adjoint", "PINN (JAX ↔ PyTorch)", "FMPE posterior (UQ)"),
+        index=1,
+        help="Each method runs the same inverse problem through a different Tesseract.",
+    )
+    st.sidebar.markdown("---")
+
+    if method == "Solver-adjoint":
+        render_solver_demo()
+    elif method.startswith("FMPE"):
+        render_fmpe_demo()
+    else:
+        render_pinn_demo()
 
 
 if __name__ == "__main__":
