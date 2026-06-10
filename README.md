@@ -87,6 +87,27 @@ versioned, framework-agnostic component behind the same contract.
        alt="One outer optimization loop drives three swappable Tesseract components (the JAX Burgers solver, the JAX/PyTorch PINN, and the apply-only FMPE posterior) behind one typed apply plus VJP interface">
 </p>
 
+The Tesseract layer is what makes this more than a Python import. Each component is a
+versioned container with a typed IO schema and VJP/JVP endpoints, so a JAX loop
+differentiates through a PyTorch model running in its own runtime, and a component can
+be pinned, shared, or served remotely without the caller changing. The swap is a
+one-line image name because the loop depends on the contract, not the implementation.
+
+### Beyond Burgers
+
+Nothing in the outer loop knows it is solving Burgers. It optimizes a parameter by
+differentiating through a Tesseract's `apply`/VJP, so the same machinery drives any
+differentiable forward model: a different PDE, an ODE system, a renderer, a climate
+emulator. Swap the `burgers_solver` image for another differentiable simulator
+(re-declaring its typed inputs) and the solver-adjoint loop transfers as-is; the PINN
+and FMPE methods follow the same surrogate / amortized-posterior recipe for any inverse
+problem with a differentiable simulator.
+
+You re-author the physics, not the plumbing: the forward model, the network or prior,
+the sensor layout, the calibration targets. The orchestration stays fixed, one
+`jax.grad` loop and one typed `apply`+VJP contract, with components swapped by image
+name.
+
 ## Quickstart
 
 ```bash
