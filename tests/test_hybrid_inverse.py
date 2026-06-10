@@ -12,8 +12,8 @@ import jax.numpy as jnp
 import optax
 import pytest
 
-import inverse_problem as ip
-from configs import (
+import burgers_inverse as ip
+from burgers_inverse.configs import (
     DataConfig,
     ProblemConfig,
     RunConfig,

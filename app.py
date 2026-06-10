@@ -17,18 +17,9 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import streamlit as st
+from tesseract_core import Tesseract
 
-from configs import (
-    DEFAULT_LOSS_WEIGHTS,
-    LOSS_WEIGHT_NAMES,
-    DataConfig,
-    LossWeights,
-    ProblemConfig,
-    RunConfig,
-    TrainingConfig,
-)
-from inverse_problem import (
-    Tesseract,
+from burgers_inverse import (
     TrainingCallback,
     docker_image_available,
     evaluate_pinn_solution_grid,
@@ -36,6 +27,15 @@ from inverse_problem import (
     image_name_for_backend,
     train_inverse,
     train_solver_inverse,
+)
+from burgers_inverse.configs import (
+    DEFAULT_LOSS_WEIGHTS,
+    LOSS_WEIGHT_NAMES,
+    DataConfig,
+    LossWeights,
+    ProblemConfig,
+    RunConfig,
+    TrainingConfig,
 )
 
 st.set_page_config(
@@ -1377,7 +1377,7 @@ def load_fmpe_bundle(path):
 
     if not Path(path).is_file():
         return None
-    from fmpe_posterior import load_model
+    from burgers_inverse.fmpe_posterior import load_model
 
     return load_model(path)
 
@@ -1385,7 +1385,7 @@ def load_fmpe_bundle(path):
 @st.cache_resource(show_spinner=False)
 def get_fmpe_component():
     """Load the local fmpe_posterior Tesseract API (apply-only component)."""
-    from component_loader import load_tesseract_api
+    from burgers_inverse.component_loader import load_tesseract_api
 
     return load_tesseract_api("fmpe_posterior")
 
@@ -1756,7 +1756,7 @@ observation and the network infers the parameters back.
         return
 
     with st.spinner("Simulating the measurement and sampling the posterior..."):
-        from fmpe_posterior import observation_from_theta
+        from burgers_inverse.fmpe_posterior import observation_from_theta
 
         observation = (
             np.asarray(

@@ -10,14 +10,14 @@ import numpy as np
 from matplotlib import colors
 from tesseract_core import Tesseract
 
-from configs import DataConfig, RunConfig, TrainingConfig
-from inverse_problem import (
+from burgers_inverse import (
     TrainingCallback,
     ensure_image_available,
     evaluate_pinn_solution_grid,
     image_name_for_backend,
     train_inverse,
 )
+from burgers_inverse.configs import DataConfig, RunConfig, TrainingConfig
 from scripts.ml_plot_style import (
     apply_ml_style,
     paper_size,

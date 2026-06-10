@@ -3,7 +3,7 @@
 import jax.numpy as jnp
 import pytest
 
-from inverse_problem import (
+from burgers_inverse import (
     DEFAULT_LOSS_WEIGHTS,
     initialize_brdr_state,
     normalize_loss_weights,

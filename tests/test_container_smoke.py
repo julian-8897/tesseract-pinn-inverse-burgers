@@ -4,7 +4,7 @@ import pytest
 from tesseract_core import Tesseract
 from tesseract_jax import apply_tesseract
 
-import inverse_problem as ip
+import burgers_inverse as ip
 
 BACKENDS = ("jax", "pytorch")
 

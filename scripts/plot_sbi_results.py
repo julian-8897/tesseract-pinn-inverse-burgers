@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
 
-from fmpe_posterior import (
+from burgers_inverse.fmpe_posterior import (
     PARAM_NAMES,
     load_model,
     observation_from_theta,

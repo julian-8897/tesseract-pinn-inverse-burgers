@@ -3,8 +3,8 @@
 import jax.numpy as jnp
 from tesseract_jax.tesseract_compat import Jaxeract
 
-import inverse_problem as ip
-from configs import RunConfig, TrainingConfig
+import burgers_inverse as ip
+from burgers_inverse.configs import RunConfig, TrainingConfig
 
 
 class _TelemetryStrategy(ip.InverseStrategy):

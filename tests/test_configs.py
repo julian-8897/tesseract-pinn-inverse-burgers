@@ -2,8 +2,8 @@
 
 import pytest
 
-from configs import FMPEConfig, LossWeights, RunConfig
-from inverse_problem import build_run_config
+from burgers_inverse import build_run_config
+from burgers_inverse.configs import FMPEConfig, LossWeights, RunConfig
 
 
 def test_build_run_config_applies_legacy_overrides():

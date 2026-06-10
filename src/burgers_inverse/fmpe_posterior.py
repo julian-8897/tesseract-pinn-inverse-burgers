@@ -29,17 +29,17 @@ import torch
 from sbi.inference import FMPE
 from sbi.utils import BoxUniform
 
-from configs import (
+from burgers_inverse.components import get_burgers_solver
+from burgers_inverse.configs import (
     DEFAULT_FMPE_PRIOR_HIGH,
     DEFAULT_FMPE_PRIOR_LOW,
     DEFAULT_NOISE_STD,
     FMPEConfig,
 )
-from inverse_problem import (
+from burgers_inverse.constants import (
     MIN_OBS_TIME,
     SOLVER_NT,
     SOLVER_NX,
-    get_burgers_solver,
 )
 
 # theta = (nu, ic_amp, ic_phase)

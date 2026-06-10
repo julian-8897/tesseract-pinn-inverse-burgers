@@ -1,7 +1,7 @@
 .PHONY: compile lint format test test-slow build-tesseracts train-posterior posterior-calibration plot-sbi plot-pinn smoke benchmark run-cli run-app
 
 compile:
-	uv run python -m compileall -q app.py component_loader.py configs.py fmpe_posterior.py inverse_problem.py scripts tests tesseracts
+	uv run python -m compileall -q app.py src/burgers_inverse scripts tests tesseracts
 
 lint:
 	uv run --with ruff ruff check .
@@ -21,7 +21,7 @@ build-tesseracts:
 	./buildall.sh
 
 train-posterior:
-	uv run python fmpe_posterior.py train --n-sims 10000
+	uv run burgers-fmpe train --n-sims 10000
 
 posterior-calibration:
 	uv run python -m scripts.fmpe_diagnostics calibrate
@@ -38,10 +38,10 @@ smoke:
 	uv run --with pytest python -m pytest tests/test_container_smoke.py -q
 
 benchmark:
-	uv run python inverse_problem.py --backend both --epochs 100 --seed 123 --out runs
+	uv run burgers-inverse --backend both --epochs 100 --seed 123 --out runs
 
 run-cli:
-	uv run python inverse_problem.py --backend both --epochs 50 --seed 123
+	uv run burgers-inverse --backend both --epochs 50 --seed 123
 
 run-app:
 	uv run streamlit run app.py

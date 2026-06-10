@@ -2,7 +2,7 @@
 
 import pytest
 
-from inverse_problem import summarize_seed_results
+from burgers_inverse import summarize_seed_results
 
 
 def test_summarize_seed_results_groups_by_backend():

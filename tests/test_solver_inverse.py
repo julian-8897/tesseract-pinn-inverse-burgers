@@ -9,8 +9,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-import inverse_problem as ip
-from configs import DataConfig, ProblemConfig, RunConfig, TrainingConfig
+import burgers_inverse as ip
+from burgers_inverse.configs import DataConfig, ProblemConfig, RunConfig, TrainingConfig
 
 NU_TRUE = 0.05
 DOMAIN = {"x": (0.0, 1.0), "t": (0.0, 1.0)}
