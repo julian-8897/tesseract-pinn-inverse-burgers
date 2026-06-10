@@ -59,41 +59,46 @@ gives the other two methods a near-exact reference to check against.
 
 ## What this repo does
 
-Each of those three methods is packaged as a
-[Tesseract](https://github.com/pasteurlabs/tesseract-core): a container exposing a
-typed `apply` interface plus a `vector_jacobian_product` where gradients are needed.
-Every method uses that same interface, so switching between them (a JAX component for
-a PyTorch one, or a point estimate for a full posterior) is a one-liner that
-leaves the optimization loop untouched!:
+Each of the three methods is packaged as a
+[Tesseract](https://github.com/pasteurlabs/tesseract-core): a container with a typed
+`apply` interface, plus a `vector_jacobian_product` for the components that are
+differentiated. They share that `apply`/VJP *pattern*, but each declares its own schema:
+the solver takes `(nu, grid, ...)`, the PINN takes `(x, t, params_flat)`, and the
+posterior takes one observation vector.
+
+The two PINN backends are the one literal drop-in. They expose an identical schema, so
+switching JAX for PyTorch is a single image name with nothing else changed:
 
 ```python
 pinn = Tesseract.from_image("pinn_jax")      # JAX / Equinox
 pinn = Tesseract.from_image("pinn_pytorch")  # PyTorch; nothing else changes, same ν
 ```
 
-That swappability is the overall goal. One `jax.grad`-based outer loop drives the JAX
-solver, the JAX or PyTorch PINN, and the flow-matching posterior neural net, because each is a
-versioned, framework-agnostic component behind the same contract.
+Two of the three methods also share one outer loop: solver-adjoint and PINN both
+optimize `log ν` by differentiating through their component's VJP with `jax.grad` and
+`optax`. The FMPE posterior sits outside that loop. It is trained offline with `sbi` and
+queried apply-only at inference (no gradient, no `log ν` step), and ships as the same
+kind of versioned, framework-agnostic component.
 
 <p align="center">
   <img src="img/system_architecture.png" width="880"
-       alt="One outer optimization loop drives three swappable Tesseract components (the JAX Burgers solver, the JAX/PyTorch PINN, and the apply-only FMPE posterior) behind one typed apply plus VJP interface">
+       alt="A jax.grad outer loop optimizes log-nu through the differentiable components (the JAX Burgers solver and the JAX/PyTorch PINN) via the shared apply/VJP interface; the apply-only FMPE posterior is trained offline and queried for samples">
 </p>
 
-Each component is a versioned container with a typed IO schema and VJP/JVP endpoints.
-The JAX loop differentiates through a PyTorch model in a separate runtime, and you can
-pin a component to a version or serve it remotely without touching the caller. The swap
-is one image name because the loop depends only on the contract.
+Each component is a versioned container with a typed IO schema, and the differentiable
+ones add VJP/JVP endpoints. The JAX loop differentiates through a PyTorch PINN running in
+a separate runtime, and you can pin a component to a version or serve it remotely without
+touching the caller.
 
 ### Scalability
 
-The outer loop never refers to Burgers equation. It differentiates a parameter through a
-Tesseract's `apply`/VJP, so it drives any differentiable forward model, from another PDE
-to a renderer. Point it at a new simulator with its own typed inputs and the
+The outer loop never refers to the Burgers equation. It differentiates a parameter
+through a Tesseract's `apply`/VJP, so it drives any differentiable forward model, from
+another PDE to a renderer. Point it at a new simulator with its own typed inputs and the
 solver-adjoint method carries over; the PINN and posterior methods reuse the same
-surrogate and amortized-inference recipe. You rewrite only the physics problem (the forward
+surrogate and amortized-inference recipe. You rewrite only the physics (the forward
 model, the network or prior, the sensor layout, the calibration); the loop and the
-same contract is intact.
+`apply`/VJP contract stay the same.
 
 ## Quickstart
 

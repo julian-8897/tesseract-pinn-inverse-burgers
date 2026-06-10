@@ -49,7 +49,7 @@
    are needed)};
 
 \draw[applyarr, draw=cLoop, line width=1pt] (loop) -- (bar)
-  node[midway, right=1pt, tag, text=cLoop] {drives every method};
+  node[midway, right=1pt, tag, text=cLoop] {drives the gradient-based methods};
 
 % ---- Three swappable components ---------------------------------------
 \node[comp, fill=cSolver!18, draw=cSolver, text=cSolver!55!black] (solver) at (3,0.2)
@@ -67,7 +67,7 @@
 \node[comp, fill=cFmpe!18, draw=cFmpe, text=cFmpe!50!black] (fmpe) at (15,0.2)
   {\textbf{fmpe\_posterior}\\[2pt]
    \footnotesize amortized flow posterior\\[3pt]
-   \footnotesize \emph{apply-only} --- no VJP\\[-1pt]
+   \footnotesize \emph{trained offline}, apply-only\\[-1pt]
    \footnotesize $\rightarrow$ posterior $(\nu, A_{\mathrm{IC}}, \varphi_{\mathrm{IC}})$};
 
 % ---- apply (down) / VJP (up) connectors -------------------------------
@@ -87,9 +87,10 @@
 % ---- swappability caption ---------------------------------------------
 \node[font=\sffamily\footnotesize\itshape, text=black!60, align=center]
   (cap) at (9,-1.9)
-  {Each component is a versioned, framework-agnostic container behind the same
-   interface,\\ so switching method or backend is a one-line
-   \texttt{Tesseract.from\_image(...)} change.};
+  {Each component is a versioned, framework-agnostic container sharing the
+   \texttt{apply}/VJP pattern.\\ The two PINN backends share one schema, so swapping them
+   is a single \texttt{Tesseract.from\_image(...)}; the solver and posterior keep their
+   own contracts.};
 
 \begin{scope}[on background layer]
   \node[rounded corners=5pt, fill=black!2, draw=black!10,
