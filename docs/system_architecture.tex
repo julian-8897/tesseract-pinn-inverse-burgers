@@ -1,5 +1,6 @@
-% System / contract diagram: one outer loop, one Tesseract interface,
-% three swappable framework-agnostic components.
+% System / contract diagram: one outer loop, a shared Tesseract interface
+% pattern, and three framework-agnostic component roles. Only the two PINN
+% implementations are literal schema-compatible swaps.
 % Compile:   pdflatex system_architecture.tex
 % Rasterize: pdftoppm -png -r 300 system_architecture.pdf raw \
 %            && magick raw-1.png -trim +repage system_architecture.png
@@ -37,26 +38,26 @@
 \node[rounded corners=3pt, fill=cLoop, text=white, align=center,
       minimum width=92mm, minimum height=13mm, inner sep=5pt] (loop) at (9,5.4)
   {\textbf{outer optimization loop}\\[1pt]
-   \footnotesize\texttt{jax.grad} / \texttt{optax} over $\log\nu$ \ \ (one
-   reverse-mode pass per step)};
+   \footnotesize\texttt{jax.value\_and\_grad} / \texttt{optax} over $\log\nu$\\[-1pt]
+   \footnotesize plus PINN parameters where applicable};
 
 % ---- Tesseract contract bar -------------------------------------------
 \node[rounded corners=3pt, fill=cBar!20, draw=cBar, text=cBar!45!black,
       align=center, minimum width=176mm, minimum height=12mm, inner sep=4pt]
       (bar) at (9,3.4)
-  {\textbf{Tesseract contract}\ \ --- \ \ one typed
-   \texttt{apply}\ \ $+$\ \ \texttt{vector\_jacobian\_product} (where gradients
-   are needed)};
+  {\textbf{Tesseract component boundary}\ \ --- \ \ component-specific typed
+   \texttt{apply} contracts\\[-1pt]
+   $+$ \ \texttt{vector\_jacobian\_product} where gradients are required};
 
 \draw[applyarr, draw=cLoop, line width=1pt] (loop) -- (bar)
   node[midway, right=1pt, tag, text=cLoop] {drives the gradient-based methods};
 
-% ---- Three swappable components ---------------------------------------
+% ---- Three component roles --------------------------------------------
 \node[comp, fill=cSolver!18, draw=cSolver, text=cSolver!55!black] (solver) at (3,0.2)
   {\textbf{burgers\_solver}\\[2pt]
    \footnotesize differentiable spectral\\[-1pt]
    \footnotesize Burgers solver (JAX)\\[3pt]
-   \footnotesize VJP $=$ PDE adjoint};
+   \footnotesize VJP $=$ discrete solver adjoint};
 
 \node[comp, fill=cPinn!18, draw=cPinn, text=cPinn!45!black] (pinn) at (9,0.2)
   {\textbf{PINN}\\[2pt]
@@ -87,10 +88,9 @@
 % ---- swappability caption ---------------------------------------------
 \node[font=\sffamily\footnotesize\itshape, text=black!60, align=center]
   (cap) at (9,-1.9)
-  {Each component is a versioned, framework-agnostic container sharing the
-   \texttt{apply}/VJP pattern.\\ The two PINN backends share one schema, so swapping them
-   is a single \texttt{Tesseract.from\_image(...)}; the solver and posterior keep their
-   own contracts.};
+  {Each versioned container defines its own typed contract and follows the same
+   Tesseract \texttt{apply}/VJP pattern.\\ Only the two PINN backends share an identical
+   schema: swapping them is a single \texttt{Tesseract.from\_image(...)} call.};
 
 \begin{scope}[on background layer]
   \node[rounded corners=5pt, fill=black!2, draw=black!10,
