@@ -9,9 +9,9 @@ import numpy as np
 import pytest
 import torch
 
-import fmpe_posterior as fp
-from component_loader import load_tesseract_api
-from configs import FMPEConfig
+from burgers_inverse import fmpe_posterior as fp
+from burgers_inverse.component_loader import load_tesseract_api
+from burgers_inverse.configs import FMPEConfig
 
 
 def test_prior_ranges():
@@ -190,12 +190,12 @@ def test_tesseract_runtime_rejects_wrong_observation_length():
 
 def test_posterior_tesseract_container():
     """The packaged posterior Tesseract returns calibrated samples for an obs."""
-    import inverse_problem as ip
+    import burgers_inverse as ip
 
     if not ip.docker_image_available("fmpe_posterior"):
         pytest.skip(
             "fmpe_posterior image not built; run "
-            "`python fmpe_posterior.py train` then `tesseract build`"
+            "`burgers-fmpe train` then `tesseract build`"
         )
 
     sensors = fp.Sensors(n_sensors=64, seed=0)  # matches the trained layout

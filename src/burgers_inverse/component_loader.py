@@ -6,7 +6,7 @@ import importlib.util
 from pathlib import Path
 from types import ModuleType
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 TESSERACTS_ROOT = REPO_ROOT / "tesseracts"
 
 

@@ -17,7 +17,7 @@ test self-skips until the images exist.
 Run both PINN backends through the same JAX/Optax outer loop:
 
 ```bash
-uv run python inverse_problem.py --backend both --epochs 100 --seed 123
+uv run burgers-inverse --backend both --epochs 100 --seed 123
 ```
 
 Point out that both runs use solver-generated noisy Burgers observations and
@@ -57,7 +57,7 @@ parameters under the same observation seed.
 ## Benchmark Artifacts
 
 ```bash
-uv run python inverse_problem.py --backend both --epochs 100 --seed 123 --out runs
+uv run burgers-inverse --backend both --epochs 100 --seed 123 --out runs
 ```
 
 Artifacts land under `runs/<timestamp>/<backend>/` for single-seed runs:

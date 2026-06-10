@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 import pathlib
 
-from configs import FMPEConfig
-from fmpe_posterior import (
+from burgers_inverse.configs import FMPEConfig
+from burgers_inverse.fmpe_posterior import (
     evaluate_posterior,
     load_model,
     result_from_bundle,

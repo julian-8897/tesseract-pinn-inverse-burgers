@@ -3,7 +3,7 @@
 import jax
 import numpy as np
 
-from component_loader import load_tesseract_api
+from burgers_inverse.component_loader import load_tesseract_api
 
 jax_api = load_tesseract_api(
     "pinn_jax",

@@ -3,7 +3,7 @@
 import jax
 import jax.numpy as jnp
 
-from component_loader import load_tesseract_api
+from burgers_inverse.component_loader import load_tesseract_api
 
 solver_api = load_tesseract_api("burgers_solver", module_name="burgers_solver_test_api")
 InputSchema = solver_api.InputSchema

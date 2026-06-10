@@ -4,7 +4,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-import inverse_problem as ip
+import burgers_inverse as ip
+from burgers_inverse import components
 
 
 def test_generate_observations_uses_burgers_solver_not_heat_equation():
@@ -46,8 +47,8 @@ def test_evaluate_pinn_solution_grid_shares_one_grid(monkeypatch):
             t[:, None] + x[None, :] + nu + jnp.asarray(ic_amp) + jnp.asarray(ic_phase)
         )
 
-    monkeypatch.setattr(ip, "apply_tesseract", fake_apply_tesseract)
-    monkeypatch.setattr(ip, "get_burgers_solver", lambda: fake_solver)
+    monkeypatch.setattr(components, "apply_tesseract", fake_apply_tesseract)
+    monkeypatch.setattr(components, "get_burgers_solver", lambda: fake_solver)
 
     x_grid, t_grid, u_pred, u_solver = ip.evaluate_pinn_solution_grid(
         0.05,

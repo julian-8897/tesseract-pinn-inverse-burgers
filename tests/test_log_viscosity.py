@@ -3,7 +3,8 @@
 import jax.numpy as jnp
 import pytest
 
-import inverse_problem
+import burgers_inverse as inverse_problem
+from burgers_inverse import losses
 
 
 def test_compute_loss_from_log_viscosity_exponentiates_nu(monkeypatch):
@@ -13,7 +14,7 @@ def test_compute_loss_from_log_viscosity_exponentiates_nu(monkeypatch):
         observed["viscosity"] = float(viscosity)
         return viscosity * 2.0
 
-    monkeypatch.setattr(inverse_problem, "compute_loss", fake_compute_loss)
+    monkeypatch.setattr(losses, "compute_loss", fake_compute_loss)
 
     loss = inverse_problem.compute_loss_from_log_viscosity(
         jnp.log(jnp.asarray(0.05)),

@@ -28,15 +28,16 @@ dependencies = [
     "zuko>=1.6.0",
 ]
 
+[project.scripts]
+burgers-inverse = "burgers_inverse.cli:main"
+burgers-fmpe = "burgers_inverse.fmpe_posterior:_main"
+
 [tool.setuptools]
-py-modules = [
-    "app",
-    "component_loader",
-    "configs",
-    "fmpe_posterior",
-    "inverse_problem",
-]
-packages = ["scripts"]
+py-modules = ["app"]
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["burgers_inverse*", "scripts*"]
 
 [tool.pytest.ini_options]
 markers = [

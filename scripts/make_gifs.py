@@ -27,7 +27,7 @@ import numpy as np
 import torch
 from matplotlib.animation import FuncAnimation, PillowWriter
 
-from inverse_problem import SOLVER_NX, get_burgers_solver
+from burgers_inverse import SOLVER_NX, get_burgers_solver
 from scripts.ml_plot_style import apply_ml_style, paper_size
 
 # Match the static figures: RdBu_r fields and the Okabe-Ito posterior palette.
@@ -129,7 +129,7 @@ def make_posterior_tracking(path, *, n_frames=36, n_samples=1500, fps=9):
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
-    from fmpe_posterior import load_model, observation_from_theta
+    from burgers_inverse.fmpe_posterior import load_model, observation_from_theta
 
     bundle = load_model("tesseracts/fmpe_posterior/posterior.pkl")
     contract = bundle["metadata"]["contract"]
