@@ -3,6 +3,7 @@
 Public API surface. The implementation is split into cohesive submodules:
 
 - :mod:`burgers_inverse.constants`     -- shared discretization grid
+- :mod:`burgers_inverse.checkpointing` -- resumable deterministic training state
 - :mod:`burgers_inverse.components`    -- Tesseract access + image guards
 - :mod:`burgers_inverse.observations`  -- solver-backed observation samplers
 - :mod:`burgers_inverse.losses`        -- PINN losses + BRDR weighting
@@ -17,6 +18,13 @@ imported explicitly (it pulls in ``sbi``/``torch``), not re-exported here.
 
 from __future__ import annotations
 
+from burgers_inverse.checkpointing import (
+    CHECKPOINT_FORMAT,
+    CHECKPOINT_VERSION,
+    config_fingerprint,
+    load_training_checkpoint,
+    save_training_checkpoint,
+)
 from burgers_inverse.cli import (
     build_run_config,
     compare_backends,
@@ -40,6 +48,7 @@ from burgers_inverse.configs import (
     DEFAULT_LOSS_WEIGHTS,
     DEFAULT_NOISE_STD,
     LOSS_WEIGHT_NAMES,
+    ComponentConfig,
     DataConfig,
     FMPEConfig,
     LossWeights,
@@ -104,6 +113,7 @@ __all__ = [
     "MIN_OBS_TIME",
     # configs
     "RunConfig",
+    "ComponentConfig",
     "ProblemConfig",
     "DataConfig",
     "TrainingConfig",
@@ -114,6 +124,12 @@ __all__ = [
     "LOSS_WEIGHT_NAMES",
     "normalize_loss_weights",
     "loss_weights_from_mapping",
+    # checkpointing
+    "CHECKPOINT_FORMAT",
+    "CHECKPOINT_VERSION",
+    "config_fingerprint",
+    "save_training_checkpoint",
+    "load_training_checkpoint",
     # components
     "get_burgers_solver",
     "get_initial_params",

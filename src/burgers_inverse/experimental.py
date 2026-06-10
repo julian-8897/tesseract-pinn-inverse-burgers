@@ -220,12 +220,13 @@ class HybridDiscrepancyStrategy(InverseStrategy):
             maxval=domain["t"][1],
         )
 
-        self.image_name = image_name_for_backend(self.backend)
+        self.image_name = image_name_for_backend(self.backend, config.components)
+        self.solver_image = config.components.solver_image
         self.owns_pinn = pinn is None
         self.owns_solver = solver is None
         self.pinn = pinn if pinn is not None else Tesseract.from_image(self.image_name)
         self.solver = (
-            solver if solver is not None else Tesseract.from_image("burgers_solver")
+            solver if solver is not None else Tesseract.from_image(self.solver_image)
         )
 
         self.params_flat = get_initial_params(self.backend, seed=self.data_config.seed)
@@ -246,7 +247,7 @@ class HybridDiscrepancyStrategy(InverseStrategy):
             "config": self.config,
             "backend": self.backend,
             "image_name": self.image_name,
-            "solver_image": "burgers_solver",
+            "solver_image": self.solver_image,
             "warmup_epochs": warmup_epochs,
             "observations": self.obs,
         }
@@ -288,7 +289,7 @@ class HybridDiscrepancyStrategy(InverseStrategy):
             "mode": "hybrid",
             "backend": self.backend,
             "tesseract_image": self.image_name,
-            "solver_image": "burgers_solver",
+            "solver_image": self.solver_image,
             **base,
             "dispersion_beta": self.problem.dispersion_beta,
             "effective_weights": self.effective_weights,
@@ -298,9 +299,47 @@ class HybridDiscrepancyStrategy(InverseStrategy):
             "solver": self.solver,
         }
 
+    def checkpoint_identity(self):
+        return {
+            "strategy": type(self).__name__,
+            "backend": self.backend,
+            "image": self.image_name,
+            "solver_image": self.solver_image,
+            "param_count": int(self.params_flat.size),
+        }
+
+    def checkpoint_state(self):
+        return {
+            "params_flat": self.params_flat,
+            "param_opt_state": self.param_opt_state,
+        }
+
+    def restore_checkpoint_state(self, state):
+        required = {"params_flat", "param_opt_state"}
+        missing = required - set(state)
+        if missing:
+            raise ValueError(
+                f"Hybrid checkpoint is missing strategy state: {sorted(missing)}"
+            )
+        params_flat = jnp.asarray(state["params_flat"])
+        if params_flat.shape != self.params_flat.shape:
+            raise ValueError(
+                "Hybrid checkpoint parameter shape does not match the selected component"
+            )
+        self.params_flat = params_flat
+        self.param_opt_state = state["param_opt_state"]
+
 
 def train_hybrid_inverse(
-    config, *, solver=None, pinn=None, callback=None, metrics_every=20
+    config,
+    *,
+    solver=None,
+    pinn=None,
+    callback=None,
+    metrics_every=20,
+    checkpoint_path=None,
+    checkpoint_every=0,
+    resume_from=None,
 ):
     """Run the hybrid calibration-with-discrepancy loop (Stage 1).
 
@@ -310,5 +349,11 @@ def train_hybrid_inverse(
     """
     strategy = HybridDiscrepancyStrategy(config, solver=solver, pinn=pinn)
     return _run_inverse_training(
-        config, strategy, callback=callback, metrics_every=metrics_every
+        config,
+        strategy,
+        callback=callback,
+        metrics_every=metrics_every,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        resume_from=resume_from,
     )

@@ -3,7 +3,7 @@
 import pytest
 
 from burgers_inverse import build_run_config
-from burgers_inverse.configs import FMPEConfig, LossWeights, RunConfig
+from burgers_inverse.configs import ComponentConfig, FMPEConfig, LossWeights, RunConfig
 
 
 def test_build_run_config_applies_legacy_overrides():
@@ -70,3 +70,25 @@ def test_fmpe_config_validates_seed_and_prior_bounds():
         FMPEConfig(training_seed=-1)
     with pytest.raises(ValueError, match="lower bound"):
         FMPEConfig(prior_low=(0.1, 0.8, -0.4))
+
+
+def test_component_config_accepts_pinned_image_references():
+    components = ComponentConfig(
+        solver_image="registry.example/burgers_solver@sha256:abc",
+        pinn_jax_image="registry.example/pinn_jax:0.1.0",
+        pinn_pytorch_image="registry.example/pinn_pytorch:0.1.0",
+    )
+    config = build_run_config(
+        config=RunConfig(components=components),
+        pinn_jax_image="registry.example/pinn_jax:0.2.0",
+    )
+
+    assert (
+        config.components.solver_image == "registry.example/burgers_solver@sha256:abc"
+    )
+    assert config.components.pinn_image("jax") == "registry.example/pinn_jax:0.2.0"
+    assert (
+        config.components.pinn_image("pytorch") == "registry.example/pinn_pytorch:0.1.0"
+    )
+    with pytest.raises(ValueError, match="Unknown PINN backend"):
+        components.pinn_image("tensorflow")

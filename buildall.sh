@@ -12,9 +12,9 @@ if ! command -v tesseract >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! tesseract --help | grep -q "autodiff"; then
+if ! tesseract --version >/dev/null 2>&1; then
     printf '%s\n' \
-        "Error: the installed tesseract command is not tesseract-core." \
+        "Error: the installed tesseract command could not report its version." \
         "https://github.com/pasteurlabs/tesseract-core"
     exit 1
 fi

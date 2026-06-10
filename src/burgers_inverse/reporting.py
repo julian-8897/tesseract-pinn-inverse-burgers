@@ -196,12 +196,13 @@ class SolverInverseCallback(TrainingCallback):
         self.rows = []
 
     def on_start(self, context):
-        initial = float(self.config.problem.initial_viscosity)
+        initial = float(context["current_viscosity"])
         CONSOLE.log("Solver-adjoint inversion (jax.grad through solver Tesseract VJP)")
         self.progress.start()
         self.task_id = self.progress.add_task(
             "solver-inverse",
             total=self.config.training.n_epochs,
+            completed=context["start_epoch"],
             loss="pending",
             nu=f"{initial:.6f}",
             error=f"{abs(initial - self.true_viscosity):.6f}",
@@ -253,13 +254,19 @@ class RichProgressCallback(TrainingCallback):
         self._last_loss = None
 
     def on_start(self, context):
-        initial = float(self.config.problem.initial_viscosity)
+        initial = float(context["current_viscosity"])
         CONSOLE.log(f"{context['backend'].upper()} PINN tesseract initialized")
+        if context["resumed_from"] is not None:
+            CONSOLE.log(
+                f"Resumed at epoch {context['start_epoch']} from "
+                f"{context['resumed_from']}"
+            )
         CONSOLE.log("Optimizing...")
         self.progress.start()
         self.task_id = self.progress.add_task(
             f"{context['backend'].upper()} training",
             total=self.config.training.n_epochs,
+            completed=context["start_epoch"],
             loss="pending",
             nu=f"{initial:.6f}",
             error=f"{abs(initial - self.true_viscosity):.6f}",

@@ -188,6 +188,31 @@ def test_tesseract_runtime_rejects_wrong_observation_length():
         )
 
 
+def test_remote_posterior_tesseract_dispatch(monkeypatch):
+    calls = {}
+
+    class FakeRemote:
+        def apply(self, payload):
+            calls["payload"] = payload
+            return {"samples": np.zeros((2, 3), dtype=np.float32)}
+
+    def fake_from_url(url):
+        calls["url"] = url
+        return FakeRemote()
+
+    monkeypatch.setattr("tesseract_core.Tesseract.from_url", fake_from_url)
+    output = fp.query_posterior_tesseract(
+        np.arange(4, dtype=np.float64),
+        seed=7,
+        url="https://posterior.example",
+    )
+
+    assert calls["url"] == "https://posterior.example"
+    assert calls["payload"]["observation"].dtype == np.float32
+    assert calls["payload"]["seed"] == 7
+    assert output["samples"].shape == (2, 3)
+
+
 def test_posterior_tesseract_container():
     """The packaged posterior Tesseract returns calibrated samples for an obs."""
     import burgers_inverse as ip

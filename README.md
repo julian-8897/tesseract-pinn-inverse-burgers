@@ -145,7 +145,7 @@ $\partial^2 u/\partial x^2$) are computed via automatic differentiation within
 each Tesseract using the native framework's autograd: `jax.grad` for the JAX
 backend and `torch.autograd.grad` for the PyTorch backend.
 
-The PINN method trains this network by minimizing a combined loss that fits the data
+The PINN method trains this network by minimizing a composite loss that fits the data
 and enforces the physics at once:
 
 ```math
@@ -204,11 +204,12 @@ The inverse loop optimizes `log_nu` and evaluates the PDE residual with
 viscosity clipping and viscosity warmup are available through `TrainingConfig`
 and the Streamlit app for more stable interactive runs.
 
-### One engine, many front ends
+### Multiple frontends using a single engine
 
 `burgers_inverse.engine` exposes `train_inverse(config, *, pinn=None, callback=None,
-metrics_every=20)`. Both the CLI and Streamlit UI call this function. Presentation
-is delegated to callbacks:
+metrics_every=20, checkpoint_path=None, checkpoint_every=0, resume_from=None)`.
+Both the CLI and Streamlit UI call this function. Presentation is delegated to
+callbacks:
 
 - `RichProgressCallback` renders CLI progress and final tables.
 - `MetricsRecorderCallback` records per-epoch metrics for CLI artifacts.
@@ -220,6 +221,11 @@ container calls across the complete epoch. Counts include the optimization pass,
 optional BRDR pointwise-loss preparation, and periodic component-metric
 evaluation, so metric epochs can contain more `apply` calls than ordinary epochs.
 
+Deterministic runs can write versioned, atomic checkpoints containing `log_nu`, both
+Optax optimizer states, PINN parameters, BRDR state, and histories. Resume validates
+the run configuration and selected component identity; only the total `n_epochs` may
+change. Checkpoints use Python pickle and must only be loaded from trusted sources.
+
 ### Configuration
 
 Run settings live in validated typed dataclasses in `burgers_inverse/configs.py`:
@@ -228,6 +234,8 @@ Run settings live in validated typed dataclasses in `burgers_inverse/configs.py`
 - `DataConfig`: observation count, noise level, and seed
 - `TrainingConfig`: epochs, learning rates, collocation/IC/BC sample counts, BRDR settings, optional viscosity warmup, and optional viscosity clipping
 - `LossWeights`: data, physics, initial-condition, and boundary-condition weights
+- `ComponentConfig`: solver, PINN, and posterior image references; values may include
+  registry names, tags, or immutable digests
 - `RunConfig`: full run configuration consumed by the inverse engine
 - `FMPEConfig`: simulation count, sensor count, noise, prior bounds, device, and
   independent sensor/simulation/training seeds for posterior training
@@ -242,6 +250,7 @@ scripts call the same training path without duplicating defaults.
 tesseract-pinn-inverse-burgers/
 ├── src/burgers_inverse/       # Installable library package
 │   ├── configs.py             # Typed, validated inverse + FMPE configurations
+│   ├── checkpointing.py       # Versioned atomic training checkpoints
 │   ├── constants.py           # Shared solver/sensor discretization grid
 │   ├── component_loader.py    # Conflict-free local Tesseract API loading
 │   ├── components.py          # Tesseract access, image guards, field evaluation
@@ -325,6 +334,18 @@ uv run burgers-inverse --backend pytorch --epochs 50
 # Reproducible single-seed run
 uv run burgers-inverse --backend jax --epochs 50 --seed 123
 
+# Save every 10 epochs and at completion
+uv run burgers-inverse --backend jax --epochs 50 \
+  --checkpoint checkpoints/pinn-jax.checkpoint --checkpoint-every 10
+
+# Continue the same run to a total of 100 epochs
+uv run burgers-inverse --backend jax --epochs 100 \
+  --resume checkpoints/pinn-jax.checkpoint
+
+# Pin a component by registry tag or immutable digest
+uv run burgers-inverse --mode solver-inverse --epochs 80 \
+  --solver-image registry.example/burgers_solver@sha256:<digest>
+
 # Override PINN loss weights
 uv run burgers-inverse --backend jax --epochs 50 \
   --w-data 1.0 --w-physics 0.2 --w-ic 0.5 --w-bc 0.5
@@ -366,8 +387,8 @@ the same problem through a different Tesseract:
 - **Posterior (FMPE).** Pick a ground-truth `(nu, ic_amp, ic_phase)`; the solver builds
   a noisy observation and the apply-only `fmpe_posterior` component returns a posterior
   in one pass, shown as marginals, a corner plot, a coverage table, and the calibration
-  caveat. Runs in-process, with no Docker image needed beyond the trained
-  `posterior.pkl`.
+  caveat. The deployment selector supports the in-process development API, the
+  packaged image, or an already-served remote Tesseract URL.
 
 The CLI and the app call the same training engines (`train_inverse`,
 `train_solver_inverse`) and the same `fmpe_posterior` component, so a run reproduces
@@ -410,6 +431,9 @@ uv run tesseract build tesseracts/fmpe_posterior
 
 # Query the posterior for an observation, via the container
 uv run burgers-fmpe demo --tesseract --nu 0.05
+
+# Query an already-served remote posterior Tesseract
+uv run burgers-fmpe demo --url https://posterior.example --nu 0.05
 
 # Run SBC/TARP plus held-out coverage and contraction metrics
 uv run python -m scripts.fmpe_diagnostics calibrate \
@@ -521,7 +545,10 @@ and sensor-layout diagnostics that `make plot-sbi` produces.
 - On scalar viscosity, solver-adjoint is more accurate and cheaper per step than the PINN. The PINN needs no solver at inference but converges slower. The JAX and PyTorch PINN backends land on the same answer, which is the backend-agnostic consistency check.
 - Each step takes one `jax.value_and_grad`, and the `tesseract_jax` dispatch layer measures the real apply/VJP counts across the full epoch.
 - Loss weights are fixed by default, with opt-in pointwise (BRDR) residual weighting. The CLI and the Streamlit app share the same callback-driven engines.
+- Deterministic PINN, solver-adjoint, and hybrid runs support atomic save/resume checkpoints that preserve optimizer and strategy state.
+- Component image references are explicit configuration and can be pinned to registry tags or immutable digests.
 - The FMPE posterior infers `(nu, ic_amp, ic_phase)` jointly, trains deterministically, writes a versioned model bundle, and ships SBC/TARP and contraction tooling.
+- FMPE inference supports in-process development, packaged-container, and remote Tesseract deployment paths.
 - A container smoke test exercises `Tesseract.from_image(...)` through `apply` and VJP when the images are built, and the figures and benchmark artifacts regenerate from one command.
 
 ## Limitations and what's next
@@ -530,7 +557,7 @@ and sensor-layout diagnostics that `make plot-sbi` produces.
 - **The deterministic methods infer one scalar.** Solver-adjoint and PINN recover only ν. The FMPE posterior already treats `ic_amp` and `ic_phase` as nuisance parameters and infers all three at once.
 - **No posterior refinement yet.** Polishing FMPE samples with a few solver-VJP gradient steps, a single honest `flow ∘ solver` pass, is not implemented.
 - **The misspecification sidebar is a documented failure, not a feature.** A KdV-Burgers truth oracle (`solve_kdv_burgers`) and a learned-discrepancy hybrid (`train_hybrid_inverse`) show a known trap: a free-form discrepancy term is confounded with the calibration parameter and biases it (Brynjarsdóttir & O'Hagan, 2014). It motivates the posterior treatment rather than competing with it.
-- **No checkpointing.** Each `apply`/VJP call rebuilds the PINN from its flat parameter vector.
+- **PINN reconstruction overhead.** Each `apply`/VJP call rebuilds the PINN from its flat parameter vector; checkpoints preserve training state but do not remove this per-call cost.
 
 ## References
 

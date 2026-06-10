@@ -19,6 +19,7 @@ from burgers_inverse.components import (
 )
 from burgers_inverse.configs import (
     DEFAULT_LOSS_WEIGHTS,
+    ComponentConfig,
     LossWeights,
     RunConfig,
     loss_weights_from_mapping,
@@ -56,6 +57,10 @@ def build_run_config(
     n_col=None,
     n_ic=None,
     n_bc=None,
+    solver_image=None,
+    pinn_jax_image=None,
+    pinn_pytorch_image=None,
+    fmpe_image=None,
 ):
     """Build a RunConfig from defaults plus legacy keyword overrides."""
     config = RunConfig() if config is None else config
@@ -110,17 +115,45 @@ def build_run_config(
     elif not isinstance(config.loss, LossWeights):
         config = replace(config, loss=loss_weights_from_mapping(config.loss))
 
+    component_updates = {}
+    if solver_image is not None:
+        component_updates["solver_image"] = solver_image
+    if pinn_jax_image is not None:
+        component_updates["pinn_jax_image"] = pinn_jax_image
+    if pinn_pytorch_image is not None:
+        component_updates["pinn_pytorch_image"] = pinn_pytorch_image
+    if fmpe_image is not None:
+        component_updates["fmpe_image"] = fmpe_image
+    if component_updates:
+        components = (
+            config.components
+            if isinstance(config.components, ComponentConfig)
+            else ComponentConfig(**config.components)
+        )
+        config = replace(
+            config,
+            components=replace(components, **component_updates),
+        )
+
     return config
 
 
-def run_solver_inverse(config):
+def run_solver_inverse(
+    config, *, checkpoint_path=None, checkpoint_every=0, resume_from=None
+):
     """Run solver-adjoint inversion with CLI presentation and image guard."""
     if config.problem.initial_viscosity <= 0:
         raise ValueError("initial_viscosity must be positive when optimizing log_nu")
-    ensure_image_available("burgers_solver")
+    ensure_image_available(config.components.solver_image)
     CONSOLE.rule("[bold cyan]Solver-Adjoint Inversion")
     callback = SolverInverseCallback(config)
-    result = train_solver_inverse(config, callback=callback)
+    result = train_solver_inverse(
+        config,
+        callback=callback,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        resume_from=resume_from,
+    )
     result["metrics_rows"] = callback.rows
     return result
 
@@ -139,6 +172,9 @@ def run_inverse_problem(
     brdr_epsilon=None,
     loss_weights=None,
     seed=None,
+    checkpoint_path=None,
+    checkpoint_every=0,
+    resume_from=None,
 ):
     """
     Run inverse problem to infer viscosity parameter.
@@ -165,11 +201,17 @@ def run_inverse_problem(
     if config.problem.initial_viscosity <= 0:
         raise ValueError("initial_viscosity must be positive when optimizing log_nu")
 
-    ensure_image_available(image_name_for_backend(config.backend))
+    ensure_image_available(image_name_for_backend(config.backend, config.components))
     log_run_header(config)
 
     callback = MetricsRecorderCallback(config)
-    result = train_inverse(config, callback=callback)
+    result = train_inverse(
+        config,
+        callback=callback,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        resume_from=resume_from,
+    )
     result["metrics_rows"] = callback.rows
     CONSOLE.log(f"Model parameters: {result['params_flat'].size}")
     return result
@@ -243,6 +285,9 @@ def run_single_backend(
     loss_weights=None,
     seed=None,
     config=None,
+    checkpoint_path=None,
+    checkpoint_every=0,
+    resume_from=None,
 ):
     """Run inverse problem with a single backend only."""
     if config is None and backend is None:
@@ -257,6 +302,9 @@ def run_single_backend(
         brdr_epsilon=brdr_epsilon,
         loss_weights=loss_weights,
         seed=seed,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        resume_from=resume_from,
     )
 
 
@@ -432,6 +480,37 @@ def main(argv=None):
         type=Path,
         help="Directory for reproducible run artifacts",
     )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="Write a resumable deterministic-training checkpoint",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="Checkpoint cadence in epochs; 0 writes only the final state",
+    )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        help="Resume from a trusted local checkpoint; --epochs is the total target",
+    )
+    parser.add_argument(
+        "--solver-image",
+        default=RunConfig().components.solver_image,
+        help="Solver Tesseract image reference, optionally registry/tag/digest pinned",
+    )
+    parser.add_argument(
+        "--pinn-jax-image",
+        default=RunConfig().components.pinn_jax_image,
+        help="JAX PINN Tesseract image reference",
+    )
+    parser.add_argument(
+        "--pinn-pytorch-image",
+        default=RunConfig().components.pinn_pytorch_image,
+        help="PyTorch PINN Tesseract image reference",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -455,11 +534,30 @@ def main(argv=None):
         brdr_beta_w=args.brdr_beta_w,
         brdr_epsilon=args.brdr_epsilon,
         loss_weights=loss_weights,
+        solver_image=args.solver_image,
+        pinn_jax_image=args.pinn_jax_image,
+        pinn_pytorch_image=args.pinn_pytorch_image,
     )
+
+    checkpoint_target = args.checkpoint or args.resume
+    multi_run = args.mode == "compare" or (
+        args.mode == "pinn" and (args.backend == "both" or args.seeds)
+    )
+    if (args.checkpoint is not None or args.resume is not None) and multi_run:
+        parser.error(
+            "Checkpoint/resume requires one deterministic method and one backend"
+        )
+    if args.checkpoint_every < 0:
+        parser.error("--checkpoint-every must be non-negative")
 
     try:
         if args.mode == "solver-inverse":
-            results = run_solver_inverse(config=config)
+            results = run_solver_inverse(
+                config=config,
+                checkpoint_path=checkpoint_target,
+                checkpoint_every=args.checkpoint_every,
+                resume_from=args.resume,
+            )
         elif args.mode == "compare":
             results = compare_methods(config=config)
         elif args.seeds:
@@ -474,6 +572,9 @@ def main(argv=None):
             results = run_single_backend(
                 backend=args.backend,
                 config=config,
+                checkpoint_path=checkpoint_target,
+                checkpoint_every=args.checkpoint_every,
+                resume_from=args.resume,
             )
         if args.out is not None:
             write_cli_artifacts(results, args.out)

@@ -20,6 +20,11 @@ import jax.numpy as jnp
 import optax
 from tesseract_core import Tesseract
 
+from burgers_inverse.checkpointing import (
+    config_fingerprint,
+    load_training_checkpoint,
+    save_training_checkpoint,
+)
 from burgers_inverse.components import (
     _solver_field,
     get_initial_params,
@@ -228,6 +233,21 @@ class InverseStrategy(ABC):
     def finalize_result(self, base: dict) -> dict:
         """Augment the engine's common ``base`` result with mode-specific keys."""
 
+    def checkpoint_identity(self) -> dict:
+        """Stable identity used to reject incompatible resume attempts."""
+        return {"strategy": type(self).__name__}
+
+    def checkpoint_state(self) -> dict:
+        """Return mode-specific trainable state for a checkpoint."""
+        return {}
+
+    def restore_checkpoint_state(self, state: dict) -> None:
+        """Restore mode-specific state from a validated checkpoint."""
+        if state:
+            raise ValueError(
+                f"{type(self).__name__} does not accept checkpoint strategy state"
+            )
+
 
 class PINNStrategy(InverseStrategy):
     """PINN inversion: jointly optimize ``log_nu`` and the PINN parameters,
@@ -245,7 +265,7 @@ class PINNStrategy(InverseStrategy):
             validate_brdr_loss_weights(self.loss_weights)
 
         self.inputs = build_training_inputs(config)
-        self.image_name = image_name_for_backend(self.backend)
+        self.image_name = image_name_for_backend(self.backend, config.components)
         self.owns_pinn = pinn is None
         self.pinn = pinn if pinn is not None else Tesseract.from_image(self.image_name)
 
@@ -384,6 +404,44 @@ class PINNStrategy(InverseStrategy):
             "pinn": self.pinn,
         }
 
+    def checkpoint_identity(self):
+        return {
+            "strategy": type(self).__name__,
+            "backend": self.backend,
+            "image": self.image_name,
+            "param_count": int(self.params_flat.size),
+        }
+
+    def checkpoint_state(self):
+        return {
+            "params_flat": self.params_flat,
+            "param_opt_state": self.param_opt_state,
+            "brdr_state": self.brdr_state,
+            "loss_weight_history": self.loss_weight_history,
+        }
+
+    def restore_checkpoint_state(self, state):
+        required = {
+            "params_flat",
+            "param_opt_state",
+            "brdr_state",
+            "loss_weight_history",
+        }
+        missing = required - set(state)
+        if missing:
+            raise ValueError(
+                f"PINN checkpoint is missing strategy state: {sorted(missing)}"
+            )
+        params_flat = jnp.asarray(state["params_flat"])
+        if params_flat.shape != self.params_flat.shape:
+            raise ValueError(
+                "PINN checkpoint parameter shape does not match the selected component"
+            )
+        self.params_flat = params_flat
+        self.param_opt_state = state["param_opt_state"]
+        self.brdr_state = state["brdr_state"]
+        self.loss_weight_history = state["loss_weight_history"]
+
 
 def solver_inverse_loss(log_viscosity, obs, solver):
     """Data-fit loss for solver-adjoint inversion: ``||solver(nu)[obs] - u_obs||^2``.
@@ -418,8 +476,9 @@ class SolverAdjointStrategy(InverseStrategy):
             noise_std=self.data_config.noise_std,
         )
         self.owns_solver = solver is None
+        self.image_name = config.components.solver_image
         self.solver = (
-            solver if solver is not None else Tesseract.from_image("burgers_solver")
+            solver if solver is not None else Tesseract.from_image(self.image_name)
         )
         self.loss_and_grad = jax.value_and_grad(solver_inverse_loss, argnums=0)
 
@@ -431,7 +490,7 @@ class SolverAdjointStrategy(InverseStrategy):
         return {
             "config": self.config,
             "backend": "solver",
-            "image_name": "burgers_solver",
+            "image_name": self.image_name,
             "warmup_epochs": warmup_epochs,
             "observations": self.obs,
         }
@@ -453,14 +512,29 @@ class SolverAdjointStrategy(InverseStrategy):
         return {
             "mode": "solver-inverse",
             "backend": "solver",
-            "tesseract_image": "burgers_solver",
+            "tesseract_image": self.image_name,
             **base,
             "observations": self.obs,
             "solver": self.solver,
         }
 
+    def checkpoint_identity(self):
+        return {
+            "strategy": type(self).__name__,
+            "image": self.image_name,
+        }
 
-def _run_inverse_training(config, strategy, *, callback=None, metrics_every=20):
+
+def _run_inverse_training(
+    config,
+    strategy,
+    *,
+    callback=None,
+    metrics_every=20,
+    checkpoint_path=None,
+    checkpoint_every=0,
+    resume_from=None,
+):
     """Drive the invariant inverse-training loop for any :class:`InverseStrategy`.
 
     Optimizes ``log_nu`` against the strategy's objective: each epoch runs the
@@ -473,6 +547,13 @@ def _run_inverse_training(config, strategy, *, callback=None, metrics_every=20):
     training = config.training
     callback = callback or TrainingCallback()
     counter = TesseractCallCounter()
+    if metrics_every <= 0:
+        raise ValueError("metrics_every must be positive")
+    if checkpoint_every < 0:
+        raise ValueError("checkpoint_every must be non-negative")
+    checkpoint_target = checkpoint_path or resume_from
+    if checkpoint_every and checkpoint_target is None:
+        raise ValueError("checkpoint_every requires checkpoint_path or resume_from")
 
     log_viscosity = jnp.log(jnp.asarray(problem.initial_viscosity))
     log_nu_bounds = None
@@ -491,12 +572,99 @@ def _run_inverse_training(config, strategy, *, callback=None, metrics_every=20):
     viscosity_history = [float(viscosity)]
     log_viscosity_history = [float(log_viscosity)]
     loss_history = {name: [] for name in strategy.loss_component_names}
+    start_epoch = 0
+    resumed_from = None
+
+    if resume_from is not None:
+        checkpoint = load_training_checkpoint(resume_from)
+        expected_fingerprint = config_fingerprint(config)
+        if checkpoint.get("config_fingerprint") != expected_fingerprint:
+            raise ValueError(
+                "Checkpoint configuration does not match this run; only n_epochs "
+                "may change when resuming"
+            )
+        expected_identity = strategy.checkpoint_identity()
+        if checkpoint.get("strategy_identity") != expected_identity:
+            raise ValueError(
+                "Checkpoint strategy/component identity does not match this run"
+            )
+
+        engine_state = checkpoint.get("engine_state", {})
+        required = {
+            "next_epoch",
+            "log_viscosity",
+            "log_visc_opt_state",
+            "times",
+            "viscosity_history",
+            "log_viscosity_history",
+            "loss_history",
+        }
+        missing = required - set(engine_state)
+        if missing:
+            raise ValueError(
+                f"Training checkpoint is missing engine state: {sorted(missing)}"
+            )
+
+        start_epoch = int(engine_state["next_epoch"])
+        if start_epoch < 0:
+            raise ValueError("Checkpoint next_epoch must be non-negative")
+        if start_epoch > training.n_epochs:
+            raise ValueError(
+                "Checkpoint is already beyond the requested total n_epochs"
+            )
+        log_viscosity = jnp.asarray(engine_state["log_viscosity"])
+        log_visc_opt_state = engine_state["log_visc_opt_state"]
+        times = list(engine_state["times"])
+        viscosity_history = list(engine_state["viscosity_history"])
+        log_viscosity_history = list(engine_state["log_viscosity_history"])
+        loaded_loss_history = engine_state["loss_history"]
+        if set(loaded_loss_history) != set(loss_history):
+            raise ValueError("Checkpoint loss history does not match this strategy")
+        loss_history = {
+            name: list(loaded_loss_history[name])
+            for name in strategy.loss_component_names
+        }
+        strategy.restore_checkpoint_state(checkpoint.get("strategy_state", {}))
+        viscosity = jnp.exp(log_viscosity)
+        resumed_from = str(resume_from)
+
+    def write_checkpoint(next_epoch):
+        if checkpoint_target is None:
+            return None
+        return save_training_checkpoint(
+            checkpoint_target,
+            {
+                "config_fingerprint": config_fingerprint(config),
+                "strategy_identity": strategy.checkpoint_identity(),
+                "engine_state": {
+                    "next_epoch": int(next_epoch),
+                    "log_viscosity": log_viscosity,
+                    "log_visc_opt_state": log_visc_opt_state,
+                    "times": times,
+                    "viscosity_history": viscosity_history,
+                    "log_viscosity_history": log_viscosity_history,
+                    "loss_history": loss_history,
+                },
+                "strategy_state": strategy.checkpoint_state(),
+            },
+        )
 
     with ExitStack() as stack:
         strategy.open_components(stack)
-        callback.on_start(strategy.start_context(warmup_epochs))
+        start_context = strategy.start_context(warmup_epochs)
+        start_context.update(
+            {
+                "start_epoch": start_epoch,
+                "current_viscosity": float(viscosity),
+                "resumed_from": resumed_from,
+                "checkpoint_path": (
+                    str(checkpoint_target) if checkpoint_target is not None else None
+                ),
+            }
+        )
+        callback.on_start(start_context)
 
-        for epoch in range(training.n_epochs):
+        for epoch in range(start_epoch, training.n_epochs):
             start_time = time.time()
             record = epoch % metrics_every == 0 or epoch == training.n_epochs - 1
             counter.reset()
@@ -550,6 +718,12 @@ def _run_inverse_training(config, strategy, *, callback=None, metrics_every=20):
                     loss_components=components,
                 )
             )
+            next_epoch = epoch + 1
+            if checkpoint_every and next_epoch % checkpoint_every == 0:
+                write_checkpoint(next_epoch)
+
+    if checkpoint_target is not None:
+        write_checkpoint(training.n_epochs)
 
     final_viscosity = float(viscosity)
     relative_error = (
@@ -567,13 +741,27 @@ def _run_inverse_training(config, strategy, *, callback=None, metrics_every=20):
         "loss_history": loss_history,
         "seed": data_config.seed,
         "config": config,
+        "start_epoch": start_epoch,
+        "resumed_from": resumed_from,
+        "checkpoint_path": (
+            str(checkpoint_target) if checkpoint_target is not None else None
+        ),
     }
     result = strategy.finalize_result(base)
     callback.on_finish(result)
     return result
 
 
-def train_inverse(config, *, pinn=None, callback=None, metrics_every=20):
+def train_inverse(
+    config,
+    *,
+    pinn=None,
+    callback=None,
+    metrics_every=20,
+    checkpoint_path=None,
+    checkpoint_every=0,
+    resume_from=None,
+):
     """Run the inverse-viscosity optimization loop (PINN method).
 
     Thin wrapper over the shared engine with a :class:`PINNStrategy`: a single
@@ -590,11 +778,26 @@ def train_inverse(config, *, pinn=None, callback=None, metrics_every=20):
     """
     strategy = PINNStrategy(config, pinn=pinn)
     return _run_inverse_training(
-        config, strategy, callback=callback, metrics_every=metrics_every
+        config,
+        strategy,
+        callback=callback,
+        metrics_every=metrics_every,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        resume_from=resume_from,
     )
 
 
-def train_solver_inverse(config, *, solver=None, callback=None, metrics_every=20):
+def train_solver_inverse(
+    config,
+    *,
+    solver=None,
+    callback=None,
+    metrics_every=20,
+    checkpoint_path=None,
+    checkpoint_every=0,
+    resume_from=None,
+):
     """Run solver-adjoint inversion: optimize ``log_nu`` against the in-loop solver.
 
     Thin wrapper over the shared engine with a :class:`SolverAdjointStrategy`.
@@ -604,7 +807,13 @@ def train_solver_inverse(config, *, solver=None, callback=None, metrics_every=20
     """
     strategy = SolverAdjointStrategy(config, solver=solver)
     return _run_inverse_training(
-        config, strategy, callback=callback, metrics_every=metrics_every
+        config,
+        strategy,
+        callback=callback,
+        metrics_every=metrics_every,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        resume_from=resume_from,
     )
 
 

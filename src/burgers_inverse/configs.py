@@ -146,6 +146,38 @@ class LossWeights:
 
 
 @dataclass(frozen=True)
+class ComponentConfig:
+    """Tesseract image references used by the inverse workflows.
+
+    Values may be local image names, tagged images such as
+    ``registry.example/pinn_jax:0.1.0``, or immutable digest references.
+    """
+
+    solver_image: str = "burgers_solver"
+    pinn_jax_image: str = "pinn_jax"
+    pinn_pytorch_image: str = "pinn_pytorch"
+    fmpe_image: str = "fmpe_posterior"
+
+    def __post_init__(self):
+        for name in (
+            "solver_image",
+            "pinn_jax_image",
+            "pinn_pytorch_image",
+            "fmpe_image",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty image reference")
+
+    def pinn_image(self, backend: str) -> str:
+        if backend == "jax":
+            return self.pinn_jax_image
+        if backend == "pytorch":
+            return self.pinn_pytorch_image
+        raise ValueError(f"Unknown PINN backend: {backend!r}")
+
+
+@dataclass(frozen=True)
 class RunConfig:
     """Complete inverse-problem run configuration."""
 
@@ -154,6 +186,7 @@ class RunConfig:
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     loss: LossWeights = field(default_factory=LossWeights)
+    components: ComponentConfig = field(default_factory=ComponentConfig)
 
     def with_backend(self, backend: str):
         return replace(self, backend=backend)

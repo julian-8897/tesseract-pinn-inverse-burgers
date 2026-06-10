@@ -59,6 +59,8 @@ tesseract_cache/
 log/
 logs/
 runs/
+checkpoints/
+*.checkpoint
 sbi-logs/
 
 # Local planning / agent notes

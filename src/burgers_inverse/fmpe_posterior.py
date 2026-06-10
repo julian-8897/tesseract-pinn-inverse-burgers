@@ -616,18 +616,25 @@ def upgrade_model_bundle(path, output=None) -> pathlib.Path:
 
 
 def query_posterior_tesseract(
-    observation, seed: int = 0, image: str = "fmpe_posterior"
+    observation,
+    seed: int = 0,
+    image: str = "fmpe_posterior",
+    url: str | None = None,
 ):
-    """Query the packaged posterior Tesseract for one observation (swappable component)."""
+    """Query a packaged local image or an already-served remote Tesseract."""
     from tesseract_core import Tesseract
 
+    payload = {
+        "observation": np.asarray(observation, dtype=np.float32).ravel(),
+        "seed": int(seed),
+    }
+    if url is not None:
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("url must be a non-empty string")
+        return Tesseract.from_url(url).apply(payload)
+
     with Tesseract.from_image(image) as tesseract:
-        return tesseract.apply(
-            {
-                "observation": np.asarray(observation, dtype=np.float32).ravel(),
-                "seed": int(seed),
-            }
-        )
+        return tesseract.apply(payload)
 
 
 def _report_samples(samples, theta_true=None):
@@ -671,6 +678,15 @@ def _main():
     demo.add_argument(
         "--tesseract", action="store_true", help="Query via the built Tesseract image"
     )
+    demo.add_argument(
+        "--image",
+        default="fmpe_posterior",
+        help="Local/registry Tesseract image reference for --tesseract",
+    )
+    demo.add_argument(
+        "--url",
+        help="Query an already-served remote Tesseract URL instead of starting an image",
+    )
 
     migrate = sub.add_parser(
         "migrate", help="Upgrade a legacy posterior.pkl to the versioned bundle format"
@@ -710,8 +726,12 @@ def _main():
         bundle = load_model(args.model)
         theta_true = (args.nu, args.ic_amp, args.ic_phase)
         x_o = observation_from_theta(theta_true, bundle["sensors"], bundle["noise_std"])
-        if args.tesseract:
-            out = query_posterior_tesseract(x_o.numpy())
+        if args.tesseract or args.url:
+            out = query_posterior_tesseract(
+                x_o.numpy(),
+                image=args.image,
+                url=args.url,
+            )
             print("\n================ FMPE POSTERIOR (Tesseract) ================")
             _report_samples(np.asarray(out["samples"]), theta_true)
         else:

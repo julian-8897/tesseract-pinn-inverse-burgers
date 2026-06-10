@@ -1747,16 +1747,54 @@ observation and the network infers the parameters back.
         step=1,
         key="fmpe_sample_seed",
     )
+    inference_target = st.sidebar.selectbox(
+        "Posterior deployment",
+        ("In-process", "Tesseract image", "Remote Tesseract URL"),
+        key="fmpe_inference_target",
+        help=(
+            "Use the local Python API for development, start the packaged image, "
+            "or query an already-served Tesseract endpoint."
+        ),
+    )
+    remote_url = None
+    fmpe_image = "fmpe_posterior"
+    if inference_target == "Tesseract image":
+        fmpe_image = st.sidebar.text_input(
+            "Posterior image",
+            value="fmpe_posterior",
+            key="fmpe_image",
+            help="Local, registry-tagged, or digest-pinned Tesseract image reference.",
+        )
+    if inference_target == "Remote Tesseract URL":
+        remote_url = st.sidebar.text_input(
+            "Tesseract URL",
+            value="http://127.0.0.1:8000",
+            key="fmpe_remote_url",
+        )
 
     if not st.sidebar.button("Sample Posterior", type="primary", key="fmpe_run"):
         st.info(
             "Set the ground-truth parameters in the sidebar and press **Sample "
-            "Posterior**. Runs in-process; no Docker image needed."
+            "Posterior**."
         )
         return
 
+    if inference_target == "Tesseract image" and not docker_image_available(fmpe_image):
+        st.error(f"Tesseract image `{fmpe_image}` was not found.")
+        st.code(
+            "make train-posterior\nuv run tesseract build tesseracts/fmpe_posterior",
+            language="bash",
+        )
+        return
+    if inference_target == "Remote Tesseract URL" and not remote_url.strip():
+        st.error("Remote Tesseract URL must not be empty.")
+        return
+
     with st.spinner("Simulating the measurement and sampling the posterior..."):
-        from burgers_inverse.fmpe_posterior import observation_from_theta
+        from burgers_inverse.fmpe_posterior import (
+            observation_from_theta,
+            query_posterior_tesseract,
+        )
 
         observation = (
             np.asarray(
@@ -1768,17 +1806,29 @@ observation and the network infers the parameters back.
             .astype(np.float32)
         )
 
-        component = get_fmpe_component()
-        out = component.apply(
-            component.InputSchema(observation=observation, seed=int(sample_seed))
-        )
+        if inference_target == "In-process":
+            component = get_fmpe_component()
+            out = component.apply(
+                component.InputSchema(observation=observation, seed=int(sample_seed))
+            )
+        else:
+            out = query_posterior_tesseract(
+                observation,
+                seed=int(sample_seed),
+                image=fmpe_image,
+                url=remote_url if inference_target == "Remote Tesseract URL" else None,
+            )
 
-    samples = np.asarray(out.samples, dtype=np.float64)
-    mean = np.asarray(out.mean, dtype=np.float64)
-    q05 = np.asarray(out.q05, dtype=np.float64)
-    q95 = np.asarray(out.q95, dtype=np.float64)
+    def output_value(name):
+        return out[name] if isinstance(out, dict) else getattr(out, name)
+
+    samples = np.asarray(output_value("samples"), dtype=np.float64)
+    mean = np.asarray(output_value("mean"), dtype=np.float64)
+    q05 = np.asarray(output_value("q05"), dtype=np.float64)
+    q95 = np.asarray(output_value("q95"), dtype=np.float64)
 
     st.success(f"Drew {samples.shape[0]} posterior samples in one apply() call.")
+    st.caption(f"Deployment path: {inference_target}")
 
     st.subheader("Posterior marginals")
     fig, axes = plt.subplots(1, len(param_names), figsize=(6 * len(param_names), 4))

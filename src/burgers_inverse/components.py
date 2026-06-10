@@ -98,9 +98,15 @@ def _solver_field(solver, nu, x_grid, t_grid, ic_amp=1.0, ic_phase=0.0):
     )["u_field"]
 
 
-def image_name_for_backend(backend):
+def image_name_for_backend(backend, components=None):
     """Map a backend name to its Tesseract image."""
-    return "pinn_jax" if backend == "jax" else "pinn_pytorch"
+    if components is not None:
+        return components.pinn_image(backend)
+    if backend == "jax":
+        return "pinn_jax"
+    if backend == "pytorch":
+        return "pinn_pytorch"
+    raise ValueError(f"Unknown PINN backend: {backend!r}")
 
 
 def docker_image_available(image_name):
