@@ -11,32 +11,33 @@
 \usetikzlibrary{positioning, arrows.meta, backgrounds, fit, calc}
 \pagestyle{empty}
 
-\definecolor{cInput}{HTML}{1F77B4}
-\definecolor{cFourier}{HTML}{6A51A3}
-\definecolor{cHidden}{HTML}{2CA02C}
-\definecolor{cOut}{HTML}{D62728}
-\definecolor{cDeriv}{HTML}{FF7F0E}
-\definecolor{cEdge}{HTML}{B0B0B0}
+% Shared brand palette (refined light)
+\definecolor{cInput}{HTML}{44566C}    % slate
+\definecolor{cFourier}{HTML}{3D3D9E}  % indigo
+\definecolor{cHidden}{HTML}{0E6E6E}   % deep teal
+\definecolor{cOut}{HTML}{9E2B3A}      % crimson
+\definecolor{cDeriv}{HTML}{B5760A}    % amber
+\definecolor{cEdge}{HTML}{9AA5AD}     % muted gray
 
 \begin{document}
 \noindent
 \begin{tikzpicture}[
   font=\sffamily,
   >={Stealth[length=2.2mm]},
-  block/.style={rounded corners=2pt, draw=black!55, line width=0.5pt,
+  block/.style={rounded corners=2pt, draw=black!55, line width=0.7pt,
                 inner xsep=7pt, inner ysep=5pt, align=center},
-  neuron/.style={circle, draw=cHidden!70, fill=cHidden!16, line width=0.4pt,
+  neuron/.style={circle, draw=cHidden!70, fill=cHidden!20, line width=0.4pt,
                  minimum size=6.5mm},
   lab/.style={font=\sffamily\footnotesize\itshape, text=black!55},
   flow/.style={->, draw=cEdge, line width=0.7pt},
 ]
 
 % ---- Input coordinates -------------------------------------------------
-\node[block, fill=cInput!12, draw=cInput, text=cInput!60!black] (in) at (0,0)
+\node[block, fill=cInput!18, draw=cInput, text=cInput!60!black] (in) at (0,0)
   {$(x,\,t)$\\[1pt]\footnotesize space--time};
 
 % ---- Fixed Fourier feature encoding -----------------------------------
-\node[block, fill=cFourier!12, draw=cFourier, text=cFourier!55!black,
+\node[block, fill=cFourier!18, draw=cFourier, text=cFourier!55!black,
       minimum height=24mm] (fourier) at (3.7,0)
   {\textbf{Fourier encoding}\\[3pt]
    \footnotesize$[\,x,\ t,$\\[-1pt]
@@ -60,17 +61,17 @@
 % sparse inter-layer edges for readability
 \foreach \a in {1,2,3,4} {
   \foreach \b in {1,2,3,4} {
-    \draw[draw=cHidden!20, line width=0.25pt] (h1\a) -- (h2\b);
-    \draw[draw=cHidden!20, line width=0.25pt] (h2\a) -- (h3\b);
+    \draw[draw=cHidden!30, line width=0.3pt] (h1\a) -- (h2\b);
+    \draw[draw=cHidden!30, line width=0.3pt] (h2\a) -- (h3\b);
   }
 }
 
 % ---- Network output u ---------------------------------------------------
-\node[block, fill=cOut!14, draw=cOut, text=cOut!58!black] (u) at (13.9,0)
+\node[block, fill=cOut!18, draw=cOut, text=cOut!58!black] (u) at (13.9,0)
   {$u_\theta(x,t)$};
 
 % ---- Native autodiff derivatives ---------------------------------------
-\node[block, fill=cDeriv!14, draw=cDeriv, text=cDeriv!52!black,
+\node[block, fill=cDeriv!18, draw=cDeriv, text=cDeriv!52!black,
       minimum height=24mm] (deriv) at (17.7,0)
   {\textbf{native autodiff}\\[3pt]
    \footnotesize$\partial_x u,\ \ \partial_t u,\ \ \partial_{xx} u$\\[4pt]
