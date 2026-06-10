@@ -32,9 +32,9 @@ for the last method the shape of the initial wave as well.
 Stated precisely: given noisy observations of the 1D Burgers solution, infer the
 viscosity $\nu$ in
 
-$$
+```math
 \frac{\partial u}{\partial t} + u \frac{\partial u}{\partial x} = \nu \frac{\partial^2 u}{\partial x^2}
-$$
+```
 
 where:
 - $u(x, t)$ is the velocity field on $[0, 1] \times [0, T]$
@@ -174,7 +174,9 @@ backend and `torch.autograd.grad` for the PyTorch backend.
 The PINN method trains this network by minimizing a combined loss that fits the data
 and enforces the physics at once:
 
-$$\mathcal{L} = \lambda_{\text{data}} \cdot \mathcal{L}_{\text{data}} + \lambda_{\text{physics}} \cdot \mathcal{L}_{\text{physics}} + \lambda_{\text{IC}} \cdot \mathcal{L}_{\text{IC}} + \lambda_{\text{BC}} \cdot \mathcal{L}_{\text{BC}}$$
+```math
+\mathcal{L} = \lambda_{\text{data}} \cdot \mathcal{L}_{\text{data}} + \lambda_{\text{physics}} \cdot \mathcal{L}_{\text{physics}} + \lambda_{\text{IC}} \cdot \mathcal{L}_{\text{IC}} + \lambda_{\text{BC}} \cdot \mathcal{L}_{\text{BC}}
+```
 
 where $\mathcal{L}_{\text{data}}$ is the mean squared error against observations,
 $\mathcal{L}_{\text{physics}}$ is the PDE residual at collocation points, and
