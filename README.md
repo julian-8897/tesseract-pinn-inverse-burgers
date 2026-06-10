@@ -7,8 +7,7 @@
 [![Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-orange.svg)](LICENSE)
 [![CI](https://github.com/julian-8897/tesseract-pinn-inverse-burgers/actions/workflows/ci.yml/badge.svg)](https://github.com/julian-8897/tesseract-pinn-inverse-burgers/actions/workflows/ci.yml)
 
-Recover the viscosity of a fluid from sparse, noisy measurements, three different
-ways, with each method packaged as a swappable
+Recover the viscosity of a fluid from sparse, noisy measurements with three different methods, with each method packaged as a swappable
 [Tesseract](https://github.com/pasteurlabs/tesseract-core) component.
 
 <p align="center">
@@ -18,40 +17,35 @@ ways, with each method packaged as a swappable
   <em><b>The forward problem, as a space-time diagram.</b> Time runs upward and the
   field u(x, t) fills in as the solver integrates. At low viscosity (left) the wave
   steepens into a sharp shock, the near-vertical red/blue interface near x = 0.5; at
-  high viscosity (right) the same wave diffuses and fades. The inverse problem is to
-  read that viscosity back from sparse samples of this field.</em>
+  high viscosity (right) the same wave diffuses. The inverse problem is to
+  recover that viscosity from sparse samples of this field.</em>
 </p>
 
 ## The problem
 
-You are given noisy measurements of a 1D fluid that follows the viscous Burgers
-equation. One number in it is unknown: the viscosity ν, which sets how fast sharp
-fronts smear out. The task is to recover ν from sparse, noisy samples of the field, and
-for the last method the shape of the initial wave as well.
+The viscous Burgers equation describes a 1D fluid whose sharp fronts smear out over
+time, at a rate set by a single number: the viscosity ν. You see the fluid only through
+sparse, noisy point measurements of its velocity field, and ν is unknown. The task is
+to recover it.
 
-Stated precisely: given noisy observations of the 1D Burgers solution, infer the
-viscosity $\nu$ in
+The field $u(x, t)$ evolves by
 
 ```math
 \frac{\partial u}{\partial t} + u \frac{\partial u}{\partial x} = \nu \frac{\partial^2 u}{\partial x^2}
 ```
 
-where:
-- $u(x, t)$ is the velocity field on $[0, 1] \times [0, T]$
-- $\nu$ is the kinematic viscosity (the inferred parameter)
-- Initial condition: $u(x, 0) = \sin(2\pi x)$
-- Boundary conditions: periodic on $[0, 1]$
+- $u(x, t)$: velocity field on the domain $[0, 1] \times [0, T]$
+- $\nu$: kinematic viscosity, the unknown to infer
+- initial condition $u(x, 0) = \sin(2\pi x)$
+- periodic boundaries on $[0, 1]$
 
-The observations are synthetic, but they come from the real nonlinear PDE rather than
-an analytic shortcut: a differentiable pseudospectral Burgers solver (FFT spatial
-derivatives, 2/3 dealiasing, adaptive Diffrax time integration), sampled at sparse
-space–time points with additive Gaussian noise ($\sigma = 0.02$ by default). That makes
-the inverse problem real, so the solver-adjoint method below recovers ν up to noise and
+The observations are synthetic, generated via a differentiable pseudospectral solver (FFT spatial derivatives, 2/3
+dealiasing, adaptive Diffrax time stepping), sampled at sparse space–time points with
+additive Gaussian noise ($\sigma = 0.02$ by default). Because the data comes from the
+true dynamics, the solver-adjoint method below recovers ν down to the noise floor and
 gives the other two methods a near-exact reference to check against.
 
-## Three ways to invert
-
-From simplest to most capable:
+## Three methods for the inverse problem
 
 1. **Solver-adjoint.** Run a differentiable spectral Burgers solver, compare its output
    to the data, and let `jax.grad` move ν downhill through the solver's VJP, which is
@@ -64,14 +58,14 @@ From simplest to most capable:
    flow-matching network, trained offline on simulations, reads one observation and
    returns a posterior over `(nu, ic_amp, ic_phase)` in a single forward pass.
 
-## What this repo is doing
+## What this repo does
 
 Each of those three methods is packaged as a
 [Tesseract](https://github.com/pasteurlabs/tesseract-core): a container exposing a
 typed `apply` interface plus a `vector_jacobian_product` where gradients are needed.
-Every method speaks that same interface, so switching between them (a JAX component for
+Every method uses that same interface, so switching between them (a JAX component for
 a PyTorch one, or a point estimate for a full posterior) is a one-line change that
-leaves the optimization loop untouched:
+leaves the optimization loop untouched!:
 
 ```python
 pinn = Tesseract.from_image("pinn_jax")      # JAX / Equinox
@@ -79,7 +73,7 @@ pinn = Tesseract.from_image("pinn_pytorch")  # PyTorch; nothing else changes, sa
 ```
 
 That swappability is the design goal. One `jax.grad`-based outer loop drives the JAX
-solver, the JAX or PyTorch PINN, and the flow-matching posterior net, because each is a
+solver, the JAX or PyTorch PINN, and the flow-matching posterior neural net, because each is a
 versioned, framework-agnostic component behind the same contract.
 
 <p align="center">
@@ -87,26 +81,20 @@ versioned, framework-agnostic component behind the same contract.
        alt="One outer optimization loop drives three swappable Tesseract components (the JAX Burgers solver, the JAX/PyTorch PINN, and the apply-only FMPE posterior) behind one typed apply plus VJP interface">
 </p>
 
-The Tesseract layer is what makes this more than a Python import. Each component is a
-versioned container with a typed IO schema and VJP/JVP endpoints, so a JAX loop
-differentiates through a PyTorch model running in its own runtime, and a component can
-be pinned, shared, or served remotely without the caller changing. The swap is a
-one-line image name because the loop depends on the contract, not the implementation.
+Each component is a versioned container with a typed IO schema and VJP/JVP endpoints.
+The JAX loop differentiates through a PyTorch model in a separate runtime, and you can
+pin a component to a version or serve it remotely without touching the caller. The swap
+is one image name because the loop depends only on the contract.
 
 ### Beyond Burgers
 
-Nothing in the outer loop knows it is solving Burgers. It optimizes a parameter by
-differentiating through a Tesseract's `apply`/VJP, so the same machinery drives any
-differentiable forward model: a different PDE, an ODE system, a renderer, a climate
-emulator. Swap the `burgers_solver` image for another differentiable simulator
-(re-declaring its typed inputs) and the solver-adjoint loop transfers as-is; the PINN
-and FMPE methods follow the same surrogate / amortized-posterior recipe for any inverse
-problem with a differentiable simulator.
-
-You re-author the physics, not the plumbing: the forward model, the network or prior,
-the sensor layout, the calibration targets. The orchestration stays fixed, one
-`jax.grad` loop and one typed `apply`+VJP contract, with components swapped by image
-name.
+The outer loop never refers to Burgers. It differentiates a parameter through a
+Tesseract's `apply`/VJP, so it drives any differentiable forward model, from another PDE
+to a renderer. Point it at a new simulator with its own typed inputs and the
+solver-adjoint method carries over; the PINN and posterior methods reuse the same
+surrogate and amortized-inference recipe. You rewrite only the physics (the forward
+model, the network or prior, the sensor layout, the calibration); the loop and the
+contract stay put.
 
 ## Quickstart
 
