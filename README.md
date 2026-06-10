@@ -7,7 +7,7 @@
 [![Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-orange.svg)](LICENSE)
 [![CI](https://github.com/julian-8897/tesseract-pinn-inverse-burgers/actions/workflows/ci.yml/badge.svg)](https://github.com/julian-8897/tesseract-pinn-inverse-burgers/actions/workflows/ci.yml)
 
-Recover the viscosity of a fluid from sparse, noisy measurements with three different methods, with each method packaged as a swappable
+Recover the viscosity of 1D Burgers equation from sparse, noisy measurements with three different methods, with each of them packaged as a swappable
 [Tesseract](https://github.com/pasteurlabs/tesseract-core) component.
 
 <p align="center">
@@ -51,9 +51,8 @@ gives the other two methods a near-exact reference to check against.
    to the data, and let `jax.grad` move ν downhill through the solver's VJP, which is
    the PDE adjoint. Accurate and cheap per step. It needs the solver in the loop.
 2. **PINN.** Train a neural network to satisfy the PDE and fit the data at once, then
-   read ν off the trained model. No solver at inference. The same network ships as
-   `pinn_jax` and `pinn_pytorch` behind one contract, so changing framework is a swap,
-   not a rewrite.
+   read ν off the trained model. No solver required at inference. The same network ships as
+   `pinn_jax` and `pinn_pytorch` behind a single contract, so changing backend is a simple swap.
 3. **Amortized posterior (FMPE).** Trade the point estimate for a distribution. A
    flow-matching network, trained offline on simulations, reads one observation and
    returns a posterior over `(nu, ic_amp, ic_phase)` in a single forward pass.
@@ -64,7 +63,7 @@ Each of those three methods is packaged as a
 [Tesseract](https://github.com/pasteurlabs/tesseract-core): a container exposing a
 typed `apply` interface plus a `vector_jacobian_product` where gradients are needed.
 Every method uses that same interface, so switching between them (a JAX component for
-a PyTorch one, or a point estimate for a full posterior) is a one-line change that
+a PyTorch one, or a point estimate for a full posterior) is a one-liner that
 leaves the optimization loop untouched!:
 
 ```python
@@ -72,7 +71,7 @@ pinn = Tesseract.from_image("pinn_jax")      # JAX / Equinox
 pinn = Tesseract.from_image("pinn_pytorch")  # PyTorch; nothing else changes, same ν
 ```
 
-That swappability is the design goal. One `jax.grad`-based outer loop drives the JAX
+That swappability is the overall goal. One `jax.grad`-based outer loop drives the JAX
 solver, the JAX or PyTorch PINN, and the flow-matching posterior neural net, because each is a
 versioned, framework-agnostic component behind the same contract.
 
@@ -86,15 +85,15 @@ The JAX loop differentiates through a PyTorch model in a separate runtime, and y
 pin a component to a version or serve it remotely without touching the caller. The swap
 is one image name because the loop depends only on the contract.
 
-### Beyond Burgers
+### Scalability
 
-The outer loop never refers to Burgers. It differentiates a parameter through a
+The outer loop never refers to Burgers equation. It differentiates a parameter through a
 Tesseract's `apply`/VJP, so it drives any differentiable forward model, from another PDE
 to a renderer. Point it at a new simulator with its own typed inputs and the
 solver-adjoint method carries over; the PINN and posterior methods reuse the same
-surrogate and amortized-inference recipe. You rewrite only the physics (the forward
+surrogate and amortized-inference recipe. You rewrite only the physics problem (the forward
 model, the network or prior, the sensor layout, the calibration); the loop and the
-contract stay put.
+same contract is intact.
 
 ## Quickstart
 
@@ -117,26 +116,8 @@ Or compare the two deterministic methods from the command line:
 uv run burgers-inverse --mode compare --epochs 100 --seed 123
 ```
 
-The posterior method needs one extra step, `make train-posterior`, covered in
+The posterior method needs an additional step, `make train-posterior`, covered in
 [Uncertainty quantification](#uncertainty-quantification-amortized-flow-matching-posterior).
-
----
-
-## Contents
-
-- [The problem](#the-problem)
-- [Three ways to invert](#three-ways-to-invert)
-- [What this repo is doing](#what-this-repo-is-doing)
-- [Quickstart](#quickstart)
-- [Implementation](#implementation)
-- [Configuration](#configuration)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Uncertainty quantification](#uncertainty-quantification-amortized-flow-matching-posterior)
-- [Results](#results)
-- [What works today](#what-works-today)
-- [Limitations and what's next](#limitations-and-whats-next)
-- [References](#references)
 
 ---
 
